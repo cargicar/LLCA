@@ -1,0 +1,3 @@
+[submodule "lca-pytorch"]
+	path = lca-pytorch
+	url = git@github.com:cargicar/lca-pytorch.git
