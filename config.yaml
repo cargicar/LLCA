@@ -1,0 +1,26 @@
+data:
+  image_glob: "cifar-10-images/*/*.png"
+  batch: 32
+
+model:
+  n_features: 3072        # 32 x 32 x 3 (derived from image size; change if using patches)
+  n_atoms: 5000
+  lam: 0.1
+  tau: 10.0
+  dt: 1.0
+  n_iter: 500
+
+inference:
+  slca_threshold: "soft"
+  hlca_threshold: "hard"
+  track_energy: true
+
+dictionary_learning:
+  enabled: true
+  steps: 2500
+  threshold: "hard"
+  learning_rate: 0.05
+  n_iter: 500
+
+output:
+  n_images: 4

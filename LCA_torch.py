@@ -217,27 +217,61 @@ class LCA(nn.Module):
 
 if __name__ == '__main__':
     import glob
+    import os
     import random
+    import shutil
+    import sys
+    import yaml
+    from datetime import datetime
     from PIL import Image
     import numpy as np
+
+    cfg_path = sys.argv[1] if len(sys.argv) > 1 else 'config.yaml'
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+
+    # ------------------------------------------------------------------ #
+    # Experiment directory: experiments/<YYYY-MM-DD_HH-MM-SS>/
+    # ------------------------------------------------------------------ #
+    exp_dir   = os.path.join('experiments', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    plots_dir = os.path.join(exp_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    shutil.copy(cfg_path, os.path.join(exp_dir, 'config.yaml'))
+
+    class _Tee:
+        """Write to multiple streams simultaneously (stdout + log file)."""
+        def __init__(self, *files):
+            self.files = files
+        def write(self, obj):
+            for f in self.files:
+                f.write(obj)
+                f.flush()
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    _log = open(os.path.join(exp_dir, 'run.log'), 'w')
+    sys.stdout = _Tee(sys.__stdout__, _log)
+    sys.stderr = _Tee(sys.__stderr__, _log)
 
     torch.manual_seed(42)
     random.seed(42)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Running on {device}\n")
+    print(f"Experiment dir: {exp_dir}")
+    print(f"Running on {device}  (config: {cfg_path})\n")
 
     # ------------------------------------------------------------------ #
     # 1. Load a batch of random CIFAR-10 images as signals
     #    Each 32x32x3 image is flattened to a vector of length N=3072
     # ------------------------------------------------------------------ #
-    N = 3072   # 32 x 32 x 3
-    M = 5000    # dictionary atoms (undercomplete for speed; increase for overcomplete)
-    BATCH = 32
-    niter= 500
-    learn_dict = True
-    learning_rate = 5e-2
+    N          = cfg['model']['n_features']
+    M          = cfg['model']['n_atoms']
+    BATCH      = cfg['data']['batch']
+    niter      = cfg['model']['n_iter']
+    learn_dict = cfg['dictionary_learning']['enabled']
+    learning_rate = cfg['dictionary_learning']['learning_rate']
 
-    image_paths = glob.glob('cifar-10-images/*/*.png')
+    image_paths = glob.glob(cfg['data']['image_glob'])
     sampled = random.sample(image_paths, BATCH)
 
     images = []
@@ -259,8 +293,10 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # 3. Run SLCA (soft threshold)
     # ------------------------------------------------------------------ #
-    slca = LCA(Phi, lam=0.1, threshold='soft', tau=10.0, n_iter=niter,
-               track_energy=True).to(device)
+    slca = LCA(Phi, lam=cfg['model']['lam'],
+               threshold=cfg['inference']['slca_threshold'],
+               tau=cfg['model']['tau'], n_iter=niter,
+               track_energy=cfg['inference']['track_energy']).to(device)
     a_soft, s_hat_soft, energies_soft = slca(s)
 
     print("=== SLCA (soft threshold) ===")
@@ -272,8 +308,10 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # 4. Run HLCA (hard threshold)
     # ------------------------------------------------------------------ #
-    hlca = LCA(Phi, lam=0.1, threshold='hard', tau=10.0, n_iter=niter,
-               track_energy=True).to(device)
+    hlca = LCA(Phi, lam=cfg['model']['lam'],
+               threshold=cfg['inference']['hlca_threshold'],
+               tau=cfg['model']['tau'], n_iter=niter,
+               track_energy=cfg['inference']['track_energy']).to(device)
     a_hard, s_hat_hard, energies_hard = hlca(s)
 
     print("=== HLCA (hard threshold) ===")
@@ -332,17 +370,23 @@ if __name__ == '__main__':
         plt.close()
         print(f"Saved {filename}")
 
-    plot_reconstructions(s, s_hat_soft, s_hat_hard, filename="reconstructions_inference.png")
+    plot_reconstructions(s, s_hat_soft, s_hat_hard,
+                         n_images=cfg['output']['n_images'],
+                         filename=os.path.join(plots_dir, "reconstructions_inference.png"))
 
     # ------------------------------------------------------------------ #
     # 7. (Optional) Dictionary learning demo — tiny example
     # ------------------------------------------------------------------ #
     if learn_dict:
-        steps = 2000
+        steps = cfg['dictionary_learning']['steps']
         print(f"=== Dictionary learning ({steps} SGD steps, tiny demo) ===")
         lca_dl = LCA(
-            Phi, lam=0.1, threshold='hard',
-            tau=10.0, n_iter=500, dt=1.0, dict_lr=learning_rate,
+            Phi, lam=cfg['model']['lam'],
+            threshold=cfg['dictionary_learning']['threshold'],
+            tau=cfg['model']['tau'],
+            n_iter=cfg['dictionary_learning']['n_iter'],
+            dt=cfg['model']['dt'],
+            dict_lr=learning_rate,
             learn_dict=True
         ).to(device)
 
@@ -355,8 +399,21 @@ if __name__ == '__main__':
                 print(f"  step {step:02d} | recon MSE = {err:.6f} | "
                     f"active = {(a_dl != 0).float().sum(dim=1).mean():.1f}")
 
-        plot_loss(losses, title="Dictionary Learning — Reconstruction MSE", filename="dict_learning_loss.png")
+        plot_loss(losses, title="Dictionary Learning — Reconstruction MSE",
+                  filename=os.path.join(plots_dir, "dict_learning_loss.png"))
 
-        plot_reconstructions(s, s_hat_hard, s_hat_dl, filename="reconstructions_dictionary_learning.png", same_T=True)
+        plot_reconstructions(s, s_hat_hard, s_hat_dl,
+                             n_images=cfg['output']['n_images'],
+                             filename=os.path.join(plots_dir, "reconstructions_dictionary_learning.png"),
+                             same_T=True)
+
+        models_dir = os.path.join(exp_dir, 'models')
+        os.makedirs(models_dir, exist_ok=True)
+        model_path = os.path.join(models_dir, 'lca_dl.pth')
+        torch.save(lca_dl.state_dict(), model_path)
+        print(f"Saved learned dictionary → {model_path}")
 
     print("\nDone.")
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    _log.close()

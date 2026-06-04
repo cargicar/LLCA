@@ -1,6 +1,8 @@
 cifar-10-images/
 session_notes.md
+experiments/
 output/
+CLAUDE.md
 *.png
 *.gif
 *.txt
