@@ -1,0 +1,13 @@
+cifar-10-images/
+session_notes.md
+output/
+*.png
+*.gif
+*.txt
+*.log
+*.csv
+*.h5
+*.ckpt
+*.pt
+*.pth
+*.ipynb

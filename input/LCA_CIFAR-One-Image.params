@@ -1,0 +1,227 @@
+debugParsing = true;
+HyPerCol "column" = {
+    checkpointWriteDir = "output/Checkpoints";
+    checkpointWriteTriggerMode = "step";
+    suppressNonplasticCheckpoints = false;
+    checkpointIndexWidth = -1;
+    randomSeed = 1234567890;
+    stopTime = 400;
+    printParamsFilename = "CIFAR_Tutorial.params";
+    errorOnNotANumber = false;
+    writeProgressToErr = true;
+    progressInterval = 400;
+    nx = 32;
+    initializeFromCheckpointDir = "";
+    dt = 1;
+    nbatch = 1;
+    deleteOlderCheckpoints = false;
+    checkpointWriteStepInterval = 400;
+    checkpointWrite = true;
+    verifyWrites = false;
+    ny = 32;
+    outputPath = "output";
+};
+
+HyPerLayer "InputError" = {
+    initializeFromCheckpointFlag = false;
+    phase = 1;
+    nf = 3;
+    updateGpu = false;
+    sparseLayer = false;
+    valueBC = 0;
+    initialWriteTime = 0;
+    writeStep = 1;
+    nyScale = 1;
+    InitVType = "ZeroV";
+    mirrorBCflag = false;
+    nxScale = 1;
+};
+
+L0NormProbe "NumNonzeroProbe" = {
+    textOutputFlag = true;
+    nnzThreshold = 0;
+    probeOutputFile = "NumNonzeroProbe.txt";
+    targetLayer = "LeakyIntegrator";
+};
+
+HyPerLayer "InputRecon" = {
+    initializeFromCheckpointFlag = false;
+    phase = 3;
+    nf = 3;
+    updateGpu = false;
+    sparseLayer = false;
+    valueBC = 0;
+    initialWriteTime = 0;
+    writeStep = 1;
+    nyScale = 1;
+    InitVType = "ZeroV";
+    mirrorBCflag = false;
+    nxScale = 1;
+};
+
+L1NormLCAProbe "SparsityProbe" = {
+    textOutputFlag = true;
+    probeOutputFile = "SparsityProbe.txt";
+    energyProbe = "TotalEnergyProbe";
+    targetLayer = "LeakyIntegrator";
+};
+
+RescaleConn "InputToError" = {
+    channelCode = 0;
+    scale = 1;
+    delay = [0];
+    postLayerName = "InputError";
+    preLayerName = "Input";
+};
+
+IdentConn "ReconToError" = {
+    channelCode = 1;
+    delay = [0];
+    postLayerName = "InputError";
+    preLayerName = "InputRecon";
+};
+
+ImageLayer "Input" = {
+    offsetY = 0;
+    phase = 0;
+    nf = 3;
+    offsetAnchor = "tl";
+    displayPeriod = 400;
+    batchMethod = "byImage";
+    initialWriteTime = 0;
+    inverseFlag = false;
+    offsetX = 0;
+    mirrorBCflag = true;
+    normalizeLuminanceFlag = true;
+    normalizeStdDev = true;
+    writeFrameToTimestamp = true;
+    useInputBCflag = false;
+    inputPath = "cifar-10-images/6/CIFAR_10000.png";
+    writeStep = 1;
+    autoResizeFlag = false;
+    nyScale = 1;
+    updateGpu = false;
+    sparseLayer = false;
+    nxScale = 1;
+};
+
+ColumnEnergyProbe "TotalEnergyProbe" = {
+    textOutputFlag = true;
+    probeOutputFile = "TotalEnergyProbe.txt";
+};
+
+CloneConn "LeakyIntegratorToRecon" = {
+    channelCode = 0;
+    postLayerName = "InputRecon";
+    receiveGpu = false;
+    originalConnName = "LeakyIntegratorToInputError";
+    pvpatchAccumulateType = "convolve";
+    updateGSynFromPostPerspective = false;
+    delay = [0];
+    preLayerName = "LeakyIntegrator";
+};
+
+MomentumConn "LeakyIntegratorToInputError" = {
+    initializeFromCheckpointFlag = false;
+    triggerLayerName = "Input";
+    plasticityFlag = false;
+    minNNZ = 0;
+    normalizeFromPostPerspective = false;
+    numAxonalArbors = 1;
+    writeCompressedCheckpoints = false;
+    delay = [0];
+    triggerOffset = 1;
+    pvpatchAccumulateType = "convolve";
+    wMaxInit = 1;
+    writeStep = infinity;
+    nxp = 8;
+    normalizeOnInitialize = true;
+    wMinInit = -1;
+    updateGSynFromPostPerspective = false;
+    momentumMethod = "viscosity";
+    weightDecayL2 = 0;
+    receiveGpu = false;
+    timeConstantTau = 5;
+    dWMax = 1;
+    nonnegativeConstraintFlag = false;
+    minL2NormTolerated = 0;
+    writeCompressedWeights = false;
+    preLayerName = "LeakyIntegrator";
+    rMinY = 0;
+    normalize_cutoff = 0;
+    channelCode = -1;
+    initialWriteTime = 0;
+    weightInitType = "UniformRandomWeight";
+    combine_dW_with_W_flag = false;
+    normalizeOnWeightUpdate = true;
+    postLayerName = "InputError";
+    normalizeArborsIndividually = false;
+    sharedWeights = true;
+    rMinX = 0;
+    normalizeMethod = "normalizeL2";
+    strength = 1;
+    nyp = 8;
+    immediateWeightUpdate = true;
+    sparseFraction = 0.9;
+};
+
+KneeTimeScaleProbe "AdaptiveTimeScales" = {
+    textOutputFlag = true;
+    tauFactor = 0.03;
+    triggerOffset = 0;
+    probeOutputFile = "AdaptiveTimeScales.txt";
+    baseMax = 0.06;
+    kneeThresh = 3.4;
+    growthFactor = 0.025;
+    baseMin = 0.05;
+    kneeSlope = 0.01;
+    writeTimeScaleFieldnames = false;
+    targetName = "TotalEnergyProbe";
+    triggerLayerName = "Input";
+};
+
+HyPerLCALayer "LeakyIntegrator" = {
+    initializeFromCheckpointFlag = false;
+    phase = 2;
+    AMax = infinity;
+    nf = 128;
+    valueV = 0.55;
+    AMin = 0;
+    initialWriteTime = 0;
+    mirrorBCflag = false;
+    adaptiveTimeScaleProbe = "AdaptiveTimeScales";
+    selfInteract = true;
+    timeConstantTau = 100;
+    VWidth = 0;
+    updateGpu = true;
+    valueBC = 0;
+    VThresh = 0.55;
+    writeStep = 1;
+    AShift = 0.55;
+    nyScale = 0.5;
+    sparseLayer = true;
+    InitVType = "ConstantV";
+    nxScale = 0.5;
+};
+
+L2NormProbe "InputErrorL2NormProbe" = {
+    textOutputFlag = true;
+    probeOutputFile = "InputErrorL2NormProbe.txt";
+    exponent = 2;
+    energyProbe = "TotalEnergyProbe";
+    targetLayer = "InputError";
+    coefficient = 0.5;
+};
+
+TransposeConn "ErrorToLeakyIntegrator" = {
+    channelCode = 0;
+    postLayerName = "LeakyIntegrator";
+    receiveGpu = true;
+    writeStep = -1;
+    originalConnName = "LeakyIntegratorToInputError";
+    pvpatchAccumulateType = "convolve";
+    updateGSynFromPostPerspective = true;
+    delay = [0];
+    preLayerName = "InputError";
+};
+
