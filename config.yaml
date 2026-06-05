@@ -1,6 +1,8 @@
 data:
   image_glob: "cifar-10-images/*/*.png"
-  batch: 32
+  batch: 32             # images for SLCA/HLCA comparison (sampled once)
+  batch_size: 64        # DataLoader batch size for dictionary learning
+  num_workers: 4
 
 model:
   n_features: 3072        # 32 x 32 x 3 (derived from image size; change if using patches)
@@ -17,7 +19,10 @@ inference:
 
 dictionary_learning:
   enabled: true
-  steps: 2500
+  epochs: 25
+  print_freq: 1
+  lambda_anneal_every: 4
+  lambda_anneal_step: 0.1
   threshold: "hard"
   learning_rate: 0.05
   n_iter: 500

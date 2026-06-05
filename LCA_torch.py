@@ -221,10 +221,12 @@ if __name__ == '__main__':
     import random
     import shutil
     import sys
+    import time
     import yaml
     from datetime import datetime
     from PIL import Image
     import numpy as np
+    from torch.utils.data import DataLoader, Dataset
 
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else 'config.yaml'
     with open(cfg_path) as f:
@@ -233,7 +235,7 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # Experiment directory: experiments/<YYYY-MM-DD_HH-MM-SS>/
     # ------------------------------------------------------------------ #
-    exp_dir   = os.path.join('experiments', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    exp_dir   = os.path.join('experiments', 'LCA_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
     plots_dir = os.path.join(exp_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
     shutil.copy(cfg_path, os.path.join(exp_dir, 'config.yaml'))
@@ -270,6 +272,18 @@ if __name__ == '__main__':
     niter      = cfg['model']['n_iter']
     learn_dict = cfg['dictionary_learning']['enabled']
     learning_rate = cfg['dictionary_learning']['learning_rate']
+
+    class _CIFARPNGDataset(Dataset):
+        def __init__(self, image_glob):
+            self.paths = sorted(glob.glob(image_glob))
+            assert len(self.paths) > 0, f"No images found at {image_glob}"
+        def __len__(self):
+            return len(self.paths)
+        def __getitem__(self, idx):
+            img = Image.open(self.paths[idx]).convert('RGB')
+            arr = np.array(img, dtype=np.float32) / 255.0
+            arr = arr - arr.mean()       # zero-mean per image
+            return torch.from_numpy(arr.flatten())  # (3072,)
 
     image_paths = glob.glob(cfg['data']['image_glob'])
     sampled = random.sample(image_paths, BATCH)
@@ -375,11 +389,16 @@ if __name__ == '__main__':
                          filename=os.path.join(plots_dir, "reconstructions_inference.png"))
 
     # ------------------------------------------------------------------ #
-    # 7. Dictionary learning demo — tiny example
+    # 7. Dictionary learning — full dataset, epoch+batch loop
     # ------------------------------------------------------------------ #
     if learn_dict:
-        steps = cfg['dictionary_learning']['steps']
-        print(f"=== Dictionary learning ({steps} SGD steps, tiny demo) ===")
+        epochs       = cfg['dictionary_learning']['epochs']
+        print_freq   = cfg['dictionary_learning']['print_freq']
+        anneal_every = cfg['dictionary_learning']['lambda_anneal_every']
+        anneal_step  = cfg['dictionary_learning']['lambda_anneal_step']
+
+        print(f"=== Dictionary learning ({epochs} epochs) ===")
+
         lca_dl = LCA(
             Phi, lam=cfg['model']['lam'],
             threshold=cfg['dictionary_learning']['threshold'],
@@ -390,14 +409,63 @@ if __name__ == '__main__':
             learn_dict=True
         ).to(device)
 
+        dl_loader = DataLoader(
+            _CIFARPNGDataset(cfg['data']['image_glob']),
+            batch_size=cfg['data']['batch_size'],
+            shuffle=True,
+            num_workers=cfg['data']['num_workers'],
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=cfg['data']['num_workers'] > 0,
+        )
+
         losses = []
-        for step in range(steps):
-            a_dl, s_hat_dl = lca_dl(s)
-            err = (s - s_hat_dl).pow(2).mean().item()
-            losses.append(err)
-            if step % 100 == 0:
-                print(f"  step {step:02d} | recon MSE = {err:.6f} | "
-                    f"active = {(a_dl != 0).float().sum(dim=1).mean():.1f}")
+        lam = cfg['model']['lam']
+
+        for epoch in range(epochs):
+            t0 = time.time()
+
+            if epoch > 0 and epoch % anneal_every == 0:
+                lam += anneal_step
+                lca_dl.lam = lam
+                print(f"  [anneal] λ → {lam:.3f}")
+
+            ep_mse = ep_sparsity = ep_active = ep_rel_err = 0.0
+
+            for batch_s in dl_loader:
+                batch_s = batch_s.to(device)
+                a_dl, s_hat_dl = lca_dl(batch_s)
+                err = (batch_s - s_hat_dl).pow(2).mean().item()
+                losses.append(err)
+
+                ep_mse      += err
+                ep_sparsity += (a_dl == 0).float().mean().item()
+                ep_active   += (a_dl != 0).float().sum(dim=1).mean().item()
+                ep_rel_err  += err / (batch_s.pow(2).mean().item() + 1e-8)
+
+            nb = len(dl_loader)
+            epoch_time = time.time() - t0
+            print(f"Epoch {epoch:02d} | {epoch_time:.1f}s ({epoch_time/nb:.2f}s/batch) | "
+                  f"Sparsity: {ep_sparsity/nb:.3f}  "
+                  f"Active: {ep_active/nb:.1f}/{M}  "
+                  f"Rel.err: {ep_rel_err/nb:.6f}  "
+                  f"recon MSE: {ep_mse/nb:.6f}  "
+                  f"λ={lam:.3f}")
+
+            # checkpoint after each epoch
+            models_dir = os.path.join(exp_dir, 'models')
+            os.makedirs(models_dir, exist_ok=True)
+            torch.save(lca_dl.state_dict(), os.path.join(models_dir, 'lca_dl.pth'))
+
+        # final summary — run inference on the fixed comparison batch s
+        print(f"\n=== LCA Dictionary Learning ({cfg['dictionary_learning']['threshold']} threshold, λ={lam:.3f}) ===")
+        with torch.no_grad():
+            G = lca_dl.Phi.detach().T @ lca_dl.Phi.detach() - torch.eye(M, device=device)
+        lca_dl.register_buffer('G', G)
+        lca_dl.learn_dict = False
+        a_dl, s_hat_dl = lca_dl(s)
+        print(f"  Sparsity (fraction zero):  {lca_dl.sparsity(a_dl):.3f}")
+        print(f"  Relative recon error:      {lca_dl.reconstruction_error(s, s_hat_dl):.6f}")
+        print(f"  Active coefficients/item:  {(a_dl != 0).float().sum(dim=1).mean():.1f} / {M}")
 
         plot_loss(losses, title="Dictionary Learning — Reconstruction MSE",
                   filename=os.path.join(plots_dir, "dict_learning_loss.png"))
@@ -407,10 +475,7 @@ if __name__ == '__main__':
                              filename=os.path.join(plots_dir, "reconstructions_dictionary_learning.png"),
                              same_T=True)
 
-        models_dir = os.path.join(exp_dir, 'models')
-        os.makedirs(models_dir, exist_ok=True)
         model_path = os.path.join(models_dir, 'lca_dl.pth')
-        torch.save(lca_dl.state_dict(), model_path)
         print(f"Saved learned dictionary → {model_path}")
 
     print("\nDone.")

@@ -16,6 +16,7 @@ References
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
 
 import glob
@@ -143,13 +144,16 @@ print_freq     = cfg['training']['print_freq']
 all_l2, all_l1, all_energy = [], [], []
 
 for epoch in range(epochs):
+    t0 = time.time()
 
     # lambda annealing: increase threshold every N epochs → sparser codes over time
     if epoch > 0 and epoch % anneal_every == 0:
         lca.lambda_ += anneal_step
         print(f"  [anneal] λ → {lca.lambda_:.3f}")
 
-    for batch_num, images in enumerate(dataloader):
+    ep_l2 = ep_l1 = ep_energy = ep_sparsity = ep_active = ep_rel_err = 0.0
+
+    for images in dataloader:
         images = images.to(dtype=dtype, device=device)
         inputs, code, recon, recon_error = lca(images)
         lca.update_weights(code, recon_error)
@@ -161,21 +165,25 @@ for epoch in range(epochs):
         all_l1.append(l1)
         all_energy.append(energy)
 
-        if batch_num % print_freq == 0:
-            # code shape: (batch, features, H_out, W_out)
-            n_total      = code.shape[1] * code.shape[2] * code.shape[3]
-            sparsity     = (code == 0).float().mean().item()
-            active       = (code != 0).float().sum(dim=(1, 2, 3)).mean().item()
-            rel_err      = (
-                (inputs - recon).pow(2).sum(dim=(1, 2, 3)) /
-                (inputs.pow(2).sum(dim=(1, 2, 3)) + 1e-8)
-            ).mean().item()
-            print(f"Epoch {epoch:02d} | Batch {batch_num:04d} | "
-                  f"Sparsity: {sparsity:.3f}  "
-                  f"Active: {active:.1f}/{n_total}  "
-                  f"Rel.err: {rel_err:.6f}  "
-                  f"L2: {l2:.4f}  L1: {l1:.4f}  Energy: {energy:.4f}  "
-                  f"λ={lca.lambda_:.3f}")
+        n_total     = code.shape[1] * code.shape[2] * code.shape[3]
+        ep_l2       += l2
+        ep_l1       += l1
+        ep_energy   += energy
+        ep_sparsity += (code == 0).float().mean().item()
+        ep_active   += (code != 0).float().sum(dim=(1, 2, 3)).mean().item()
+        ep_rel_err  += (
+            (inputs - recon).pow(2).sum(dim=(1, 2, 3)) /
+            (inputs.pow(2).sum(dim=(1, 2, 3)) + 1e-8)
+        ).mean().item()
+
+    nb = len(dataloader)
+    epoch_time = time.time() - t0
+    print(f"Epoch {epoch:02d} | {epoch_time:.1f}s ({epoch_time/nb:.2f}s/batch) | "
+          f"Sparsity: {ep_sparsity/nb:.3f}  "
+          f"Active: {ep_active/nb:.1f}/{n_total}  "
+          f"Rel.err: {ep_rel_err/nb:.6f}  "
+          f"L2: {ep_l2/nb:.4f}  L1: {ep_l1/nb:.4f}  Energy: {ep_energy/nb:.4f}  "
+          f"λ={lca.lambda_:.3f}")
 
     # save checkpoint after every epoch (overwrites — keeps only latest)
     torch.save(lca.state_dict(), os.path.join(models_dir, 'lca_cifar_lcapt.pth'))
