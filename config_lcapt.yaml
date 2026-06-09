@@ -8,7 +8,7 @@ model:
   in_channels: 3              # RGB
   kernel_size: 9              # spatial size of each atom (9x9)
   stride: 2
-  lambda_: 0.05               # LCA firing threshold
+  lambda_: 0.1               # LCA firing threshold
   tau: 100                    # LCA time constant
   lca_iters: 500              # ODE steps per forward pass
   learning_rate: 0.01         # eta for built-in Hebbian weight update
@@ -18,7 +18,7 @@ training:
   lambda_anneal_every: 3      # increase lambda_ by lambda_anneal_step every N epochs
   lambda_anneal_step: 0.1
   print_freq: 20              # print metrics every N batches
-  dtype: "float16"            # "float16" (faster on GPU) or "float32"
+  dtype: "float32"            # float16 overflows during the 500-iter LCA ODE; use float32 or bfloat16
 
 output:
   n_images: 4                 # images to show in reconstruction plot

@@ -1,0 +1,31 @@
+name: lca-cifar
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # PyTorch with CUDA 12.4 support
+  - pytorch>=2.3.0
+  - torchvision>=0.18.0
+  - pytorch-cuda=12.4
+
+  # Core scientific stack
+  - numpy>=1.21.2
+  - matplotlib>=3.5.0
+  - pillow>=9.0
+
+  # Data / config
+  - pyyaml>=6.0
+  - pandas>=1.3.4
+
+  # ML utilities (required by lcapt)
+  - scikit-learn>=1.2.2
+
+  - pip:
+    # lcapt (lca-pytorch submodule — install in editable mode from local path)
+    - -e ./lca-pytorch
