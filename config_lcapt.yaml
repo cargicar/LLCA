@@ -1,24 +1,26 @@
 data:
   image_glob: "cifar-10-images/*/*.png"   # local CIFAR-10 PNGs
-  batch_size: 16384
+  batch_size: 256
   num_workers: 4
 
 model:
-  features: 64                # number of dictionary atoms
-  in_channels: 3              # RGB
-  kernel_size: 8              # spatial size of each atom (9x9)
-  stride: 8
-  lambda_: 0.1               # LCA firing threshold
-  tau: 100                    # LCA time constant
-  lca_iters: 500              # ODE steps per forward pass
-  learning_rate: 0.01         # eta for built-in Hebbian weight update
+  features: 128
+  in_channels: 3
+  kernel_size: 9           # must be odd (lcapt pad='same' requires odd kernel)
+  stride: 4
+  lambda_: 0.05            # low start: let dict learn reconstruction quality before sparsity pressure
+  tau: 100
+  lca_iters: 750
+  learning_rate: 0.005
 
 training:
-  epochs: 12
-  lambda_anneal_every: 3      # increase lambda_ by lambda_anneal_step every N epochs
-  lambda_anneal_step: 0.05
-  print_freq: 20              # print metrics every N batches
-  dtype: "float32"            # float16 overflows during the 500-iter LCA ODE; use float32 or bfloat16
+  epochs: 55
+  lambda_anneal_start: 15  # warmup: 15 epochs of free reconstruction before any annealing
+  lambda_anneal_stop: 40   # hold λ fixed from epoch 40 onward (λ≈0.57 at that point)
+  lambda_anneal_every: 1   # anneal every epoch during the annealing phase
+  lambda_anneal_step: 0.01  # λ trajectory: 0.05 → (ep15) 0.07 → ... → (ep40) 0.57 → hold until ep54
+  print_freq: 20
+  dtype: "float32"
 
 output:
-  n_images: 4                 # images to show in reconstruction plot
+  n_images: 4

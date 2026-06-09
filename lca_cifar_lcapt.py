@@ -224,9 +224,11 @@ def main():
     # ------------------------------------------------------------------ #
     # Training loop
     # ------------------------------------------------------------------ #
-    epochs       = cfg['training']['epochs']
-    anneal_every = cfg['training']['lambda_anneal_every']
-    anneal_step  = cfg['training']['lambda_anneal_step']
+    epochs        = cfg['training']['epochs']
+    anneal_every  = cfg['training']['lambda_anneal_every']
+    anneal_step   = cfg['training']['lambda_anneal_step']
+    anneal_start  = cfg['training'].get('lambda_anneal_start', 0)
+    anneal_stop   = cfg['training'].get('lambda_anneal_stop', epochs)
 
     all_l2, all_l1, all_energy = [], [], []
 
@@ -237,7 +239,9 @@ def main():
 
         t0 = time.time()
 
-        if epoch > 0 and epoch % anneal_every == 0:
+        # Warmup phase: hold λ fixed until lambda_anneal_start epochs have passed,
+        # then anneal every lambda_anneal_every epochs thereafter.
+        if epoch > 0 and anneal_start <= epoch < anneal_stop and (epoch - anneal_start) % anneal_every == 0:
             lca_inner.lambda_ += anneal_step
             if is_main:
                 print(f"  [anneal] λ → {lca_inner.lambda_:.3f}")
