@@ -124,3 +124,6 @@ Both variants achieve ~98% sparsity, activating only ~4–5 atoms per signal on 
 - Driving inputs `b = s @ Phi` compute all inner products `⟨φ_m, s⟩` in a single matmul.
 - Lateral inhibition `a @ G.T` is naturally one-way: inactive nodes (where `a = 0`) contribute nothing, matching the paper's energy-efficient inhibition property.
 - The module is fully batched and device-agnostic — works on CPU and GPU via standard `.to(device)`.
+
+## Copy data from RNET
+rsync -avz --progress FPC/ hyperion:/data/mldc/

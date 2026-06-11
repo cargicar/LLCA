@@ -1,22 +1,19 @@
 """
 lcapt inference — loads a saved LCAConv2D (lca_cifar_lcapt.pth) and runs sparse coding
-on a fresh random batch of CIFAR-10 images.
+on a fresh random batch of CIFAR-10 test images.
+
+Automatically reads the final λ from the experiment's run.log and switches the
+image glob to the test split.  Results are saved inside the experiment directory
+under an inference/ subfolder (timestamped to allow multiple runs).
 
 Usage
 -----
-    python lcapt_inference.py <path/to/lca_cifar_lcapt.pth> [config_lcapt.yaml]
-
-If config_lcapt.yaml is omitted, looks for one in the experiment directory
-that contains the .pth file (two levels up from models/), then falls back to
-./config_lcapt.yaml.
-
-Output is saved to a new timestamped experiments/lcapt_inference_<datetime>/ directory.
+    python lcapt_inference.py <path/to/models/lca_cifar_lcapt.pth>
 """
 
 import glob
 import os
-import random
-import shutil
+import re
 import sys
 from datetime import datetime
 
@@ -35,28 +32,59 @@ from lcapt.metric import compute_l1_sparsity, compute_l2_error
 # ---------------------------------------------------------------------------
 
 if len(sys.argv) < 2:
-    print("Usage: python lcapt_inference.py <lca_cifar_lcapt.pth> [config_lcapt.yaml]")
+    print("Usage: python lcapt_inference.py <path/to/models/lca_cifar_lcapt.pth>")
     sys.exit(1)
 
 pth_path = sys.argv[1]
 
-if len(sys.argv) > 2:
-    cfg_path = sys.argv[2]
-else:
-    candidate = os.path.join(os.path.dirname(os.path.dirname(pth_path)), 'config_lcapt.yaml')
-    cfg_path  = candidate if os.path.exists(candidate) else 'config_lcapt.yaml'
+# Derive experiment directory: models/ is one level below the experiment root
+exp_dir = os.path.dirname(os.path.dirname(os.path.abspath(pth_path)))
+
+# ---------------------------------------------------------------------------
+# Load and patch config
+#   - switch image_glob to test split
+#   - replace lambda_ with the final trained value from run.log
+# ---------------------------------------------------------------------------
+
+cfg_path = os.path.join(exp_dir, 'config_lcapt.yaml')
+if not os.path.exists(cfg_path):
+    print(f"Error: config not found at {cfg_path}")
+    sys.exit(1)
 
 with open(cfg_path) as f:
     cfg = yaml.safe_load(f)
 
+# 1. Switch to test set
+cfg['data']['image_glob'] = 'cifar-10-images/test/*/*.png'
+
+# 2. Read final lambda from run.log
+log_path = os.path.join(exp_dir, 'run.log')
+final_lambda = None
+if os.path.exists(log_path):
+    with open(log_path) as f:
+        content = f.read()
+    # Last occurrence of λ=<value> in the log (appears on every epoch line)
+    matches = re.findall(r'λ=([0-9]+\.[0-9]+)', content)
+    if matches:
+        final_lambda = float(matches[-1])
+
+if final_lambda is not None:
+    cfg['model']['lambda_'] = final_lambda
+else:
+    print(f"Warning: could not parse final λ from {log_path}, using config value {cfg['model']['lambda_']}")
+
 # ---------------------------------------------------------------------------
-# Experiment directory
+# Inference output directory — inside the experiment folder
 # ---------------------------------------------------------------------------
 
-exp_dir   = os.path.join('experiments', 'lcapt_inference_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
-plots_dir = os.path.join(exp_dir, 'plots')
+inf_dir   = os.path.join(exp_dir, 'inference', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+plots_dir = os.path.join(inf_dir, 'plots')
 os.makedirs(plots_dir, exist_ok=True)
-shutil.copy(cfg_path, os.path.join(exp_dir, 'config_lcapt.yaml'))
+
+# Save the patched config so the inference run is fully reproducible
+patched_cfg_path = os.path.join(inf_dir, 'config_lcapt.yaml')
+with open(patched_cfg_path, 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
 
 
 class _Tee:
@@ -71,7 +99,7 @@ class _Tee:
             f.flush()
 
 
-_log = open(os.path.join(exp_dir, 'run.log'), 'w')
+_log = open(os.path.join(inf_dir, 'run.log'), 'w')
 sys.stdout = _Tee(sys.__stdout__, _log)
 sys.stderr = _Tee(sys.__stderr__, _log)
 
@@ -82,12 +110,13 @@ sys.stderr = _Tee(sys.__stderr__, _log)
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 dtype  = torch.float16 if cfg['training']['dtype'] == 'float16' else torch.float32
 
-print(f"Experiment dir: {exp_dir}")
-print(f"Model:          {pth_path}")
-print(f"Config:         {cfg_path}")
-print(f"Device:         {device}  dtype={dtype}\n")
-
-BATCH = cfg['data']['batch_size']
+print(f"Experiment dir:  {exp_dir}")
+print(f"Inference dir:   {inf_dir}")
+print(f"Model:           {pth_path}")
+print(f"Config:          {cfg_path}")
+print(f"Device:          {device}  dtype={dtype}")
+print(f"λ (final):       {cfg['model']['lambda_']}")
+print(f"Image glob:      {cfg['data']['image_glob']}\n")
 
 # ---------------------------------------------------------------------------
 # Load model
@@ -96,7 +125,7 @@ BATCH = cfg['data']['batch_size']
 lca = LCAConv2D(
     out_neurons=cfg['model']['features'],
     in_neurons=cfg['model']['in_channels'],
-    result_dir=os.path.join(exp_dir, 'lca_results'),
+    result_dir=os.path.join(inf_dir, 'lca_results'),
     kernel_size=cfg['model']['kernel_size'],
     stride=cfg['model']['stride'],
     lambda_=cfg['model']['lambda_'],
@@ -108,26 +137,27 @@ lca = LCAConv2D(
 lca.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
 lca.eval()
 
-print(f"Loaded LCAConv2D  weights shape: {lca.weights.shape}  from {pth_path}\n")
+print(f"Loaded LCAConv2D  weights shape: {lca.weights.shape}\n")
 
 # ---------------------------------------------------------------------------
-# Load images  (no seed → different batch every run)
+# Load test images
 # ---------------------------------------------------------------------------
 
 class _CIFARPNGDataset(Dataset):
     def __init__(self, image_glob):
         self.paths = sorted(glob.glob(image_glob))
+        assert len(self.paths) > 0, f"No images found at {image_glob}"
     def __len__(self):
         return len(self.paths)
     def __getitem__(self, idx):
         img = Image.open(self.paths[idx]).convert('RGB')
         arr = np.array(img, dtype=np.float32) / 255.0
-        return torch.from_numpy(arr.transpose(2, 0, 1))  # (C, H, W)
+        return torch.from_numpy(arr.transpose(2, 0, 1))
 
-dset      = _CIFARPNGDataset(cfg['data']['image_glob'])
-loader    = DataLoader(dset, batch_size=BATCH, shuffle=True, num_workers=0)
-images    = next(iter(loader)).to(dtype=dtype, device=device)
-print(f"Loaded {images.shape[0]} CIFAR-10 images, shape: {images.shape}\n")
+dset   = _CIFARPNGDataset(cfg['data']['image_glob'])
+loader = DataLoader(dset, batch_size=cfg['data']['batch_size'], shuffle=True, num_workers=0)
+images = next(iter(loader)).to(dtype=dtype, device=device)
+print(f"Test set: {len(dset)} images  |  batch shape: {images.shape}\n")
 
 # ---------------------------------------------------------------------------
 # Inference
@@ -172,7 +202,7 @@ axes[0, 1].set_title('Reconstruction')
 axes[0, 2].set_title('Recon Error')
 
 for i in range(n):
-    inp = recon[i] + recon_error[i]   # lcapt normalizes internally; recover original
+    inp = recon[i] + recon_error[i]
     axes[i, 0].imshow(to_rgb(inp))
     axes[i, 1].imshow(to_rgb(recon[i]))
     axes[i, 2].imshow(to_rgb(recon_error[i]))

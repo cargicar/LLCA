@@ -1,5 +1,5 @@
 data:
-  image_glob: "cifar-10-images/*/*.png"   # local CIFAR-10 PNGs
+  image_glob: "cifar-10-images/train/*/*.png"   # local CIFAR-10 PNGs Training
   batch_size: 256
   num_workers: 4
 
