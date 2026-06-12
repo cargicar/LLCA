@@ -277,6 +277,13 @@ rel_err  = (
     (inputs.pow(2).sum(dim=(1, 2, 3, 4)) + 1e-8)
 ).mean().item()
 
+_patch_index_bits   = int(np.ceil(np.log2(n_total + 1)))
+_patch_bytes_per_nz = 4 + (_patch_index_bits + 7) // 8
+_patch_bytes_in     = dcfg['patch_size']**3 * 4
+_patch_bytes_sparse = active * _patch_bytes_per_nz
+patch_comp_ratio    = _patch_bytes_in / _patch_bytes_sparse if _patch_bytes_sparse > 0 else float('inf')
+patch_bpv           = _patch_bytes_sparse * 8 / dcfg['patch_size']**3
+
 print(f"=== LCAConv3D inference  (λ={lca.lambda_:.3f}) ===")
 print(f"  Sparsity (fraction zero):  {sparsity:.3f}")
 print(f"  Relative recon error:      {rel_err:.6f}")
@@ -284,6 +291,7 @@ print(f"  Active coefficients/item:  {active:.1f} / {n_total}")
 print(f"  L2 recon error:            {l2:.4f}")
 print(f"  L1 sparsity cost:          {l1:.4f}")
 print(f"  Total energy (L2+L1):      {l2+l1:.4f}")
+print(f"  Compression ratio (patch): {patch_comp_ratio:.2f}x  BPV: {patch_bpv:.2f}")
 print()
 
 # ---------------------------------------------------------------------------
@@ -319,8 +327,10 @@ for row_block in range(n):
                 ax.set_title(title, fontsize=8)
             ax.axis('off')
 
-plt.suptitle(f'3D patch reconstructions  λ={lca.lambda_:.3f}  t={dcfg["timestep"]}',
-             fontsize=9)
+plt.suptitle(
+    f'3D patch reconstructions  |  t={dcfg["timestep"]}  λ={lca.lambda_:.3f}  '
+    f'rel_err={rel_err:.4f}  CompRatio={patch_comp_ratio:.2f}x  BPV={patch_bpv:.2f}',
+    fontsize=9)
 plt.tight_layout()
 out = os.path.join(plots_dir, 'reconstructions.png')
 plt.savefig(out, dpi=150)
@@ -452,9 +462,11 @@ for row, (plane_lbl, inp_p, rec_p, err_p) in enumerate(plane_defs):
         ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
         plt.colorbar(im, ax=ax, shrink=0.8)
 
-fig.suptitle(f'Full-volume reconstruction  λ={lca.lambda_:.3f}  t={dcfg["timestep"]}  '
-             f'sparsity={vstats["sparsity"]:.3f}  rel_err={vstats["rel_err"]:.4f}',
-             fontsize=9)
+fig.suptitle(
+    f'Full-volume reconstruction  |  t={dcfg["timestep"]}  λ={lca.lambda_:.3f}  '
+    f'rel_err={vstats["rel_err"]:.4f}  CompRatio={comp_ratio:.2f}x  BPV={bpv:.2f}  '
+    f'sparsity={vstats["sparsity"]:.3f}',
+    fontsize=9)
 plt.tight_layout()
 out = os.path.join(plots_dir, 'full_volume_reconstruction.png')
 plt.savefig(out, dpi=150, bbox_inches='tight')
@@ -469,9 +481,10 @@ plane_data = [
 ]
 
 fig, axes = plt.subplots(2, 3, figsize=(14, 9))
-fig.suptitle(f'Input vs Reconstruction — three planes  '
-             f'λ={lca.lambda_:.3f}  t={dcfg["timestep"]}  '
-             f'rel_err={vstats["rel_err"]:.4f}', fontsize=10)
+fig.suptitle(
+    f'Input vs Reconstruction — three planes  |  t={dcfg["timestep"]}  λ={lca.lambda_:.3f}  '
+    f'rel_err={vstats["rel_err"]:.4f}  CompRatio={comp_ratio:.2f}x  BPV={bpv:.2f}',
+    fontsize=10)
 
 row_labels = ['Input', 'Reconstruction']
 for col, (plane_lbl, inp_p, rec_p) in enumerate(plane_data):

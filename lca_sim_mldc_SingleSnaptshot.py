@@ -238,25 +238,50 @@ def main():
     # ------------------------------------------------------------------ #
     # Training loop
     # ------------------------------------------------------------------ #
-    epochs       = cfg['training']['epochs']
-    anneal_every = cfg['training']['lambda_anneal_every']
-    anneal_step  = cfg['training']['lambda_anneal_step']
-    anneal_start = cfg['training'].get('lambda_anneal_start', 0)
-    anneal_stop  = cfg['training'].get('lambda_anneal_stop', epochs)
+    max_epochs       = cfg['training']['max_epochs']
+    anneal_every     = cfg['training']['lambda_anneal_every']
+    anneal_step      = cfg['training']['lambda_anneal_step']
+    anneal_start     = cfg['training'].get('lambda_anneal_start', 0)   # fallback only
+    anneal_stop      = cfg['training'].get('lambda_anneal_stop', max_epochs)
+    rel_err_target   = cfg['training'].get('rel_err_target', None)
+    stabilize_epochs = cfg['training'].get('stabilize_epochs', 10)
 
-    all_l2, all_l1, all_energy = [], [], []
+    all_l2, all_l1, all_energy, all_rel_err = [], [], [], []
 
-    for epoch in range(epochs):
+    # Compression constants — computed once from config (patch-level COO sparse storage)
+    _P             = dcfg['patch_size']
+    _n_code_patch  = mcfg['features'] * (_P // mcfg['stride'])**3   # code positions per patch
+    _index_bits    = int(np.ceil(np.log2(_n_code_patch + 1)))
+    _bytes_per_nz  = 4 + (_index_bits + 7) // 8   # float32 value + packed flat index
+    _bytes_in      = _P**3 * 4                     # float32 input per patch (1 channel)
+
+    # mode='pre'      : waiting for rel_err <= target before first anneal
+    # mode='stabilize': λ frozen, counting stabilize_epochs (used before AND during annealing)
+    # mode='anneal'   : λ increasing every anneal_every epochs
+    # When rel_err_target is None: skip state machine, use fixed anneal_start/stop (legacy).
+    mode         = 'pre' if rel_err_target is not None else 'anneal'
+    stab_count   = 0
+    anneal_epoch = 0   # epochs spent in 'anneal' mode (used for anneal_every and anneal_stop)
+
+    for epoch in range(max_epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
         t0 = time.time()
 
-        if epoch > 0 and anneal_start <= epoch < anneal_stop \
-                and (epoch - anneal_start) % anneal_every == 0:
-            lca_inner.lambda_ += anneal_step
-            if is_main:
-                print(f"  [anneal] λ → {lca_inner.lambda_:.3f}")
+        # ---- annealing step at epoch start ----
+        if rel_err_target is not None:
+            if mode == 'anneal' and anneal_epoch % anneal_every == 0:
+                lca_inner.lambda_ += anneal_step
+                if is_main:
+                    print(f"  [anneal] λ → {lca_inner.lambda_:.3f}  "
+                          f"(anneal epoch {anneal_epoch}/{anneal_stop})")
+        else:
+            if epoch > 0 and anneal_start <= epoch < anneal_stop \
+                    and (epoch - anneal_start) % anneal_every == 0:
+                lca_inner.lambda_ += anneal_step
+                if is_main:
+                    print(f"  [anneal] λ → {lca_inner.lambda_:.3f}")
 
         ep_l2 = ep_l1 = ep_energy = ep_sparsity = ep_active = ep_rel_err = 0.0
 
@@ -279,6 +304,10 @@ def main():
                 all_l2.append(l2)
                 all_l1.append(l1)
                 all_energy.append(energy)
+                all_rel_err.append(
+                    ((inputs - recon).pow(2).sum(dim=(1, 2, 3, 4)) /
+                     (inputs.pow(2).sum(dim=(1, 2, 3, 4)) + 1e-8)).mean().item()
+                )
 
             # code shape: (B, features, D_out, H_out, W_out)
             n_total      = code.shape[1] * code.shape[2] * code.shape[3] * code.shape[4]
@@ -295,16 +324,56 @@ def main():
         nb         = len(dataloader)
         epoch_time = time.time() - t0
 
+        avg_rel_err  = ep_rel_err / nb
+        avg_active   = ep_active / nb
+        bytes_sparse = avg_active * _bytes_per_nz
+        comp_ratio   = _bytes_in / bytes_sparse if bytes_sparse > 0 else float('inf')
+        bpv          = bytes_sparse * 8 / _P**3
+
         if is_main:
+            if mode == 'stabilize':
+                mode_tag = f"  [stabilize {stab_count}/{stabilize_epochs}]"
+            elif mode == 'anneal':
+                mode_tag = f"  [anneal ep {anneal_epoch}/{anneal_stop}]"
+            else:
+                mode_tag = "  [pre-anneal]"
             print(
                 f"Epoch {epoch:02d} | {epoch_time:.1f}s ({epoch_time/nb:.2f}s/batch) | "
                 f"Sparsity: {ep_sparsity/nb:.3f}  "
-                f"Active: {ep_active/nb:.1f}/{n_total}  "
-                f"Rel.err: {ep_rel_err/nb:.6f}  "
+                f"Active: {avg_active:.1f}/{n_total}  "
+                f"Rel.err: {avg_rel_err:.6f}  "
                 f"L2: {ep_l2/nb:.4f}  L1: {ep_l1/nb:.4f}  "
-                f"Energy: {ep_energy/nb:.4f}  λ={lca_inner.lambda_:.3f}"
+                f"Energy: {ep_energy/nb:.4f}  λ={lca_inner.lambda_:.3f}  "
+                f"CompRatio: {comp_ratio:.2f}x  BPV: {bpv:.2f}"
+                + mode_tag
             )
             torch.save(lca_inner.state_dict(), os.path.join(models_dir, 'lca_simmldc.pth'))
+
+        # ---- state machine (rel_err-gated) ----
+        if rel_err_target is not None:
+            if mode in ('pre', 'anneal') and avg_rel_err <= rel_err_target:
+                prev_mode  = mode
+                mode       = 'stabilize'
+                stab_count = 0
+                if is_main:
+                    reason = 'before first anneal' if prev_mode == 'pre' else 'mid-anneal'
+                    print(f"  [stabilize] rel_err={avg_rel_err:.6f} <= {rel_err_target} — "
+                          f"freezing λ for {stabilize_epochs} epochs ({reason})")
+            elif mode == 'stabilize':
+                stab_count += 1
+                if stab_count >= stabilize_epochs:
+                    if anneal_epoch >= anneal_stop:
+                        if is_main:
+                            print("  [done] annealing complete + stabilized — stopping training")
+                        break
+                    mode       = 'anneal'
+                    stab_count = 0
+                    if is_main:
+                        verb = 'Starting' if anneal_epoch == 0 else 'Resuming'
+                        print(f"  [stabilize] done — {verb} λ annealing")
+
+        if mode == 'anneal':
+            anneal_epoch += 1
 
     # ------------------------------------------------------------------ #
     # Post-training output
@@ -327,20 +396,40 @@ def main():
               f"(first batch: {all_energy[0]:.4f})")
 
         # Plot 1 — loss curves
-        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-        for ax, values, label in zip(
-            axes, [all_l2, all_l1, all_energy],
-            ['L2 Recon Error', 'L1 Sparsity', 'Total Energy']
-        ):
-            ax.plot(values)
-            ax.set_ylabel(label)
-        axes[-1].set_xlabel('Batch (across all epochs)')
-        axes[0].set_title('LCAConv3D — Training Metrics')
-        plt.tight_layout()
-        out = os.path.join(plots_dir, 'training_metrics.png')
-        plt.savefig(out)
-        plt.close()
-        print(f"Saved {out}")
+        plot_start_epoch = cfg['output'].get('plot_start_epoch', 0)
+        nb_plot          = len(dataloader)
+        skip             = plot_start_epoch * nb_plot
+
+        def _save_metrics_plot(data_lists, start_batch, title, filename):
+            fig, axes = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
+            labels     = ['L2 Recon Error', 'L1 Sparsity', 'Total Energy', 'Relative Error']
+            log_panels = {0, 2}   # L2 and Energy benefit from log scale
+            for idx, (ax, values, label) in enumerate(zip(axes, data_lists, labels)):
+                sliced = values[start_batch:]
+                ax.plot(sliced)
+                ax.set_ylabel(label)
+                if idx in log_panels and any(v > 0 for v in sliced):
+                    ax.set_yscale('log')
+            if rel_err_target is not None:
+                axes[3].axhline(rel_err_target, color='r', linestyle='--', linewidth=0.8,
+                                label=f'target={rel_err_target}')
+                axes[3].legend(fontsize=8)
+            x0 = start_batch
+            axes[-1].set_xlabel(f'Batch (across all epochs, starting batch {x0})')
+            axes[0].set_title(title)
+            plt.tight_layout()
+            path = os.path.join(plots_dir, filename)
+            plt.savefig(path)
+            plt.close()
+            print(f"Saved {path}")
+
+        metric_lists = [all_l2, all_l1, all_energy, all_rel_err]
+        _save_metrics_plot(metric_lists, 0,    'LCAConv3D — Training Metrics',
+                           'training_metrics.png')
+        if plot_start_epoch > 0:
+            _save_metrics_plot(metric_lists, skip,
+                               f'LCAConv3D — Training Metrics (from epoch {plot_start_epoch})',
+                               'training_metrics_tail.png')
 
         # Plot 2 — dictionary atoms (mid-plane slice of each 3D kernel)
         # weights shape: (features, in_channels, kD, kH, kW)
@@ -388,6 +477,12 @@ def main():
             for ax, data in zip(axes[i], [inp_s, rec_s, err_s]):
                 ax.imshow(data, cmap='RdBu_r', vmin=-vmax_i, vmax=vmax_i)
                 ax.axis('off')
+        fig.suptitle(
+            f'Reconstructions  |  t={dcfg["timestep"]}  '
+            f'rel_err={avg_rel_err:.4f}  '
+            f'CompRatio={comp_ratio:.2f}x  BPV={bpv:.2f}',
+            fontsize=9
+        )
         plt.tight_layout()
         out = os.path.join(plots_dir, 'reconstructions.png')
         plt.savefig(out)
