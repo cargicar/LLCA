@@ -1,0 +1,42 @@
+data:
+  h5_path:    "/data/mldc/pde_bench/Turb_M1.hdf5"
+  field_key:  "pressure"
+  timestep:   15
+  patch_size: 72
+  n_patches:  2000
+  batch_size: 16
+  num_workers: 4
+
+model:
+  features:      128
+  in_channels:   1
+  kernel_size:   9
+  stride:        4
+  lambda_:       0.05
+  tau:           100
+  lca_iters:     600   # used during warmup; reduced to lca_iters_warm once predictor activates
+  learning_rate: 0.01
+
+warp:
+  pred_channels:  [32, 64]   # hidden channel dims in the 3-layer predictor CNN
+  pred_lr:        0.0003     # Adam lr for predictor
+  k_grad:         20         # LCA Euler steps to backprop through (gradient step)
+  warmup_epochs:  10         # epochs of plain LCA before predictor activates
+  lca_iters_warm: 200        # LCA iters for Hebbian step once predictor is active
+  pred_every:     1          # update predictor every N batches (1 = every batch)
+  load_lca:       null       # optional: path to pretrained LCA .pth to start from
+
+training:
+  max_epochs:          400
+  lambda_anneal_start: 15    # fallback only (used when rel_err_target is not set)
+  lambda_anneal_stop:  200
+  lambda_anneal_every: 1
+  lambda_anneal_step:  0.02
+  dtype:               "float32"
+  rel_err_target:      0.004
+  rel_err_ceiling:     0.01
+  stabilize_epochs:    10
+
+output:
+  n_images:         4
+  plot_start_epoch: 5

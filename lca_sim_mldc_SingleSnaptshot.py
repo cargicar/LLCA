@@ -244,6 +244,7 @@ def main():
     anneal_start     = cfg['training'].get('lambda_anneal_start', 0)   # fallback only
     anneal_stop      = cfg['training'].get('lambda_anneal_stop', max_epochs)
     rel_err_target   = cfg['training'].get('rel_err_target', None)
+    rel_err_ceiling  = cfg['training'].get('rel_err_ceiling', 0.01)
     stabilize_epochs = cfg['training'].get('stabilize_epochs', 10)
 
     all_l2, all_l1, all_energy, all_rel_err = [], [], [], []
@@ -259,9 +260,12 @@ def main():
     # mode='stabilize': λ frozen, counting stabilize_epochs (used before AND during annealing)
     # mode='anneal'   : λ increasing every anneal_every epochs
     # When rel_err_target is None: skip state machine, use fixed anneal_start/stop (legacy).
-    mode         = 'pre' if rel_err_target is not None else 'anneal'
-    stab_count   = 0
-    anneal_epoch = 0   # epochs spent in 'anneal' mode (used for anneal_every and anneal_stop)
+    mode              = 'pre' if rel_err_target is not None else 'anneal'
+    stab_count        = 0
+    anneal_epoch      = 0    # epochs spent in 'anneal' mode (used for anneal_every and anneal_stop)
+    last_avg_rel_err  = 0.0  # previous epoch's rel_err — used by ceiling guard
+    best_comp_ratio   = 0.0  # tracks highest compression seen while rel_err <= ceiling
+    best_lambda       = mcfg['lambda_']
 
     for epoch in range(max_epochs):
         if sampler is not None:
@@ -272,10 +276,15 @@ def main():
         # ---- annealing step at epoch start ----
         if rel_err_target is not None:
             if mode == 'anneal' and anneal_epoch % anneal_every == 0:
-                lca_inner.lambda_ += anneal_step
-                if is_main:
-                    print(f"  [anneal] λ → {lca_inner.lambda_:.3f}  "
-                          f"(anneal epoch {anneal_epoch}/{anneal_stop})")
+                if last_avg_rel_err <= rel_err_ceiling:
+                    lca_inner.lambda_ += anneal_step
+                    if is_main:
+                        print(f"  [anneal] λ → {lca_inner.lambda_:.3f}  "
+                              f"(anneal epoch {anneal_epoch}/{anneal_stop})")
+                else:
+                    if is_main:
+                        print(f"  [anneal] λ increment skipped — "
+                              f"rel_err={last_avg_rel_err:.4f} > ceiling={rel_err_ceiling}")
         else:
             if epoch > 0 and anneal_start <= epoch < anneal_stop \
                     and (epoch - anneal_start) % anneal_every == 0:
@@ -348,6 +357,17 @@ def main():
                 + mode_tag
             )
             torch.save(lca_inner.state_dict(), os.path.join(models_dir, 'lca_simmldc.pth'))
+
+            # best-compression checkpoint: highest comp_ratio seen while rel_err <= ceiling
+            if avg_rel_err <= rel_err_ceiling and comp_ratio > best_comp_ratio:
+                best_comp_ratio = comp_ratio
+                best_lambda     = lca_inner.lambda_
+                torch.save(lca_inner.state_dict(),
+                           os.path.join(models_dir, 'lca_simmldc_best_compression.pth'))
+                print(f"  [best] CompRatio={best_comp_ratio:.2f}x  "
+                      f"λ={best_lambda:.3f}  rel_err={avg_rel_err:.4f}  BPV={bpv:.2f}")
+
+        last_avg_rel_err = avg_rel_err
 
         # ---- state machine (rel_err-gated) ----
         if rel_err_target is not None:
