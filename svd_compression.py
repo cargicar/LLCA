@@ -17,8 +17,16 @@ Compression model (per patch)
   - Storage  : k × float32 = k × 4 bytes  (no index overhead, unlike COO LCA)
   - Basis Vt : k × P³ × 4 bytes total, amortised over all patches in the volume
 
-Compression ratio (coefficients only, basis overhead excluded):
-  comp_ratio = (P³ × 4) / (k × 4) = P³ / k
+Compression metrics reported:
+  comp_coeff    = (P³ × 4) / (k × 4) = P³ / k          ← coefficients only, 4 bytes each
+  comp_lca_equiv = (P³ × 4) / (k × bytes_per_coo)       ← same COO formula as LCA's comp_ratio
+    bytes_per_coo = 4 + ceil(ceil(log2(k+1)) / 8)          (float32 value + packed flat index)
+  comp_total    = (P³ × 4) / (k×4 + k×P³×4/n_patches)  ← amortised basis included
+
+comp_lca_equiv is directly comparable to LCA's comp_ratio: both exclude model overhead and use
+the same COO byte-counting formula.  Residual differences reflect (a) SVD stores all k
+coefficients (no sparsity) while LCA stores only avg_active non-zeros, and (b) SVD's index
+range is k (small) vs LCA's n_code_patch = features × (P//stride)³ (large → higher index cost).
 
 Usage
 -----
@@ -69,7 +77,6 @@ def extract_tiled_patches(vol: np.ndarray, patch_size: int):
     D, H, W = vol.shape
     P = patch_size
     nD, nH, nW = D // P, H // P, W // P
-
     positions = [(i*P, j*P, k*P)
                  for i in range(nD)
                  for j in range(nH)
@@ -141,6 +148,16 @@ def compute_metrics(
     comp_total     = bytes_in / bytes_total if bytes_total > 0 else float('inf')
     bpv_total      = (bytes_total * 8) / P3
 
+    # LCA-equivalent metric: same COO sparse-storage formula as lca_sim_mldc_SingleSnaptshot.py
+    #   _bytes_per_nz = 4 + (_index_bits + 7) // 8
+    # Applied to SVD's k dense ordered coefficients; index range = [0, k) so index cost
+    # is much smaller than LCA's (k << features × (P//stride)³).
+    _index_bits_svd = int(np.ceil(np.log2(k + 1))) if k > 1 else 1
+    _bytes_per_coo  = 4 + (_index_bits_svd + 7) // 8
+    _bytes_code_coo = k * _bytes_per_coo
+    comp_lca_equiv  = bytes_in / _bytes_code_coo if _bytes_code_coo > 0 else float('inf')
+    bpv_lca_equiv   = (_bytes_code_coo * 8) / P3
+
     return dict(
         k=k,
         rel_err=rel_err,
@@ -150,6 +167,8 @@ def compute_metrics(
         bpv_coeff=bpv_coeff,
         comp_total=comp_total,
         bpv_total=bpv_total,
+        comp_lca_equiv=comp_lca_equiv,
+        bpv_lca_equiv=bpv_lca_equiv,
     )
 
 
@@ -261,9 +280,10 @@ def main():
 
     results = []
     print(f"{'k':>6}  {'rel_err':>10}  {'PSNR(dB)':>10}  "
-          f"{'CompRatio(coeff)':>18}  {'BPV(coeff)':>12}  "
-          f"{'CompRatio(+basis)':>19}  {'BPV(+basis)':>13}")
-    print('-' * 100)
+          f"{'Comp(coeff)':>13}  {'BPV(coeff)':>12}  "
+          f"{'Comp(+basis)':>14}  {'BPV(+basis)':>13}  "
+          f"{'Comp(LCA-eq)':>14}  {'BPV(LCA-eq)':>13}")
+    print('-' * 118)
 
     for k in k_values:
         coeffs_k = coeffs_full[:, :k]           # (n_patches, k)
@@ -275,8 +295,9 @@ def main():
         m = compute_metrics(input_vol, recon_vol, k, P, n_patches)
         results.append(m)
         print(f"{k:>6}  {m['rel_err']:>10.6f}  {m['psnr']:>10.2f}  "
-              f"{m['comp_coeff']:>18.2f}x  {m['bpv_coeff']:>12.3f}  "
-              f"{m['comp_total']:>19.2f}x  {m['bpv_total']:>13.3f}")
+              f"{m['comp_coeff']:>13.2f}x  {m['bpv_coeff']:>12.3f}  "
+              f"{m['comp_total']:>14.2f}x  {m['bpv_total']:>13.3f}  "
+              f"{m['comp_lca_equiv']:>14.2f}x  {m['bpv_lca_equiv']:>13.3f}")
 
     print()
 
@@ -284,13 +305,14 @@ def main():
     under_1pct = [r for r in results if r['rel_err'] <= 0.01]
     if under_1pct:
         best = max(under_1pct, key=lambda r: r['comp_coeff'])
-        print(f"Best (rel_err ≤ 1%): k={best['k']}  "
-              f"rel_err={best['rel_err']:.4f}  "
-              f"comp_ratio={best['comp_coeff']:.2f}x  BPV={best['bpv_coeff']:.3f}")
+        print(f"Best (rel_err ≤ 1%): k={best['k']}  rel_err={best['rel_err']:.4f}  "
+              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV(coeff)={best['bpv_coeff']:.3f}  "
+              f"comp(LCA-eq)={best['comp_lca_equiv']:.2f}x  BPV(LCA-eq)={best['bpv_lca_equiv']:.3f}")
     else:
         best = min(results, key=lambda r: r['rel_err'])
         print(f"Note: rel_err never reaches 1% — "
-              f"best is k={best['k']}  rel_err={best['rel_err']:.4f}")
+              f"best is k={best['k']}  rel_err={best['rel_err']:.4f}  "
+              f"comp(LCA-eq)={best['comp_lca_equiv']:.2f}x  BPV(LCA-eq)={best['bpv_lca_equiv']:.3f}")
 
     # ------------------------------------------------------------------ #
     # Plot 1 — Singular value spectrum
@@ -366,9 +388,11 @@ def main():
     # ------------------------------------------------------------------ #
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.semilogy(bpvs, rel_errs, 'o-', color='steelblue', markersize=5,
-                label='SVD (coeff only)')
+                label='SVD (coeff only, 4 B/coeff)')
     ax.semilogy([r['bpv_total'] for r in results], rel_errs, 's--',
                 color='teal', markersize=4, alpha=0.7, label='SVD (+ amortised basis)')
+    ax.semilogy([r['bpv_lca_equiv'] for r in results], rel_errs, '^:',
+                color='darkorange', markersize=4, alpha=0.9, label='SVD (LCA-equiv COO storage)')
 
     ax.axhline(0.01, color='red', linestyle=':', linewidth=1, label='1% error target')
 
@@ -415,7 +439,7 @@ def main():
     fig.suptitle(
         f'SVD Full-volume reconstruction  |  k={best_k}  '
         f'rel_err={best["rel_err"]:.4f}  '
-        f'CompRatio={best["comp_coeff"]:.1f}x  BPV={best["bpv_coeff"]:.3f}',
+        f'comp_ratio={best["comp_coeff"]:.1f}x  BPV={best["bpv_coeff"]:.3f}',
         fontsize=10
     )
     for col, (lbl, inp_p, rec_p) in enumerate(plane_defs):
@@ -488,7 +512,8 @@ def main():
     print(f"k for 99% variance:         {k99}  →  comp={P**3/k99:.1f}x  BPV={k99*32/P**3:.3f}")
     if under_1pct:
         print(f"Best (rel_err ≤ 1%):        k={best['k']}  "
-              f"comp={best['comp_coeff']:.2f}x  BPV={best['bpv_coeff']:.3f}")
+              f"comp(coeff)={best['comp_coeff']:.2f}x  BPV={best['bpv_coeff']:.3f}  "
+              f"comp(LCA-eq)={best['comp_lca_equiv']:.2f}x  BPV(LCA-eq)={best['bpv_lca_equiv']:.3f}")
     if args.lca_bpv:
         print(f"LCA reference:              BPV={args.lca_bpv:.3f}  rel_err={args.lca_rel_err}")
 
