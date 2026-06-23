@@ -125,11 +125,86 @@ python svd_compression.py config_simmldc.yaml --k-values 5 10 20 50
 - The rate-distortion plot (`rate_distortion.png`) shows directly where LCA sits relative to the SVD Pareto front.
 
 
-# Single Simulation Multiple Snapshops
-
-# Multiple Simulations 
-
 ### Notes on meetings June 22 / 2026
 - DO SVD to compare with LLCA
 - Try spare dict initialization (AI or sckit-learn)
 - Get rip of patching
+
+---
+
+## Hybrid SVD+LCA
+
+Three architectural directions that move LCA toward globally-aware representations, addressing its main weakness on smooth, globally-correlated pressure fields where SVD dominates.
+
+#### SVD-initialized dictionary
+Initialize `lca.weights` from the right singular vectors `Vt[:features]` of the patch matrix (computed once, as in `svd_compression.py`) instead of random truncated-normal. This puts LCA at the globally-optimal linear starting point. Hebbian updates then refine the dictionary toward atoms that also support sparse codes.
+
+Hypothesis: LCA may converge to higher sparsity when initialized at the SVD basis because the basis already explains most variance — residuals after projecting onto the top modes are smaller and naturally sparser. Implements the meeting-note item "Try sparse dict initialization".
+
+```python
+# After SVD(X, k_max) — Vt shape: (k_max, P³)
+lca_init = torch.from_numpy(Vt[:mcfg['features']]).reshape(
+    mcfg['features'], 1, k, k, k   # reshape to (features, in_ch, kD, kH, kW)
+)
+lca.weights.data.copy_(lca_init)
+lca.normalize_weights()
+```
+
+#### Get rid of patching
+Run LCA (or a learned global transform) directly on the full 3D volume without patch extraction. Without patching the receptive field spans the whole volume, capturing long-range correlations that make SVD efficient. This is the meeting-note item "Get rid of patching" and the architectural analogue of what SVD does: find global basis vectors rather than local 9³ kernels.
+
+Concretely: replace `LCAConv3D` with a fully-connected dictionary `(N_voxels, M)` and learn sparse codes via Hebbian updates on the full volume. At convergence this recovers the sparse PCA / dictionary-learning solution, which is a generalization of SVD that allows non-orthogonal, overcomplete bases.
+
+#### Hybrid: SVD global modes + LCA sparse residual
+Use SVD to remove the dominant low-rank structure, then run LCA only on the residual. The residual is less globally correlated and potentially sparse in a local convolutional basis.
+
+Storage: `k` dense SVD coefficients (4 bytes each, flat) + sparse LCA code of the residual (COO). If the residual is 10× sparser than the original signal, the combined scheme can beat standalone SVD at the same reconstruction quality.
+
+```python
+# Encode
+svd_coeffs  = patch_norm @ Vt[:k].T          # (k,) — k dense floats
+residual    = patch_norm - svd_coeffs @ Vt[:k]
+lca_code    = LCA(residual)                   # sparse COO on the residual
+
+# Decode
+patch_norm_hat = svd_coeffs @ Vt[:k] + LCA_recon(lca_code)
+```
+
+---
+
+#### Additional Tweaks to improve LCA compression after training
+
+These require no architectural changes and can be applied to any already-trained LCA checkpoint.
+
+**1. Entropy-code the sparse output**
+The COO 7-bytes/nz model assumes flat storage. Active LCA indices cluster spatially (features fire in connected regions), so lossless entropy coding of the serialized code tensor compresses both the value and index streams significantly. Apply as a post-processing step at inference time — no retraining needed.
+
+```python
+import zlib
+compressed = zlib.compress(code_coo_bytes, level=6)
+effective_comp_ratio = raw_bytes / len(compressed)
+```
+Typical gain on structured sparse codes: **1.5–4×** additional compression over raw COO for free.
+
+**2. Quantize coefficient values**
+The float32 value per non-zero (4 bytes) can be reduced without retraining. float16 halves the value cost with negligible quality impact; int8 with a per-patch scale factor reduces it to 1 byte at ~0.5% additional quantization error.
+
+| Format | bytes/value | bytes_per_nz | Gain vs float32 |
+|---|---|---|---|
+| float32 (current) | 4 | 7 | — |
+| float16 | 2 | 5 | 1.4× |
+| int8 + scale | 1 | 4 | 1.75× |
+
+**3. Increase stride**
+Larger stride reduces code positions per patch (18³ → 9³ for stride 4→8), directly reducing `avg_active` at the same sparsity fraction and proportionally improving `comp_ratio`. Needs retraining. The quality tradeoff must be measured empirically.
+
+| stride | n_code_patch | bytes_per_nz | Estimated comp_ratio (at ~96% sparsity) |
+|---|---|---|---|
+| 4 (current) | 746,496 | 7 | ~6.7× |
+| 8 | 93,312 | 7 | ~53× |
+| 12 | 27,648 | 6 | ~90× |
+
+
+# Single Simulation Multiple Snapshops
+
+# Multiple Simulations 
