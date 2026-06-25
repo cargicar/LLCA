@@ -1,3 +1,107 @@
+# Theoretical Considerations
+
+## SVD on rectangular vs square patch matrices
+
+In `svd_compression.py` the data matrix `X` has shape `(n_patches, P³)`.  With `patch_size=27` and a 256³ volume this is **(729 × 19,683) — short and wide**: far fewer patches than patch dimensions.
+
+**Compression ratio is P³/k regardless of X's shape.**
+The Eckart-Young theorem guarantees the rank-k SVD truncation is the *optimal* k-dimensional approximation of X in L2.  Whether X is 729×19,683 or 19,683×19,683, for the same k you store k coefficients instead of P³ values per patch.  The square structure of the matrix does not change that ratio.
+
+> **Eckart-Young theorem (1936):** Among all rank-k matrices, the truncated SVD gives the one closest to the original matrix in Frobenius norm (and in spectral norm).  Concretely, if `X = U Σ Vt` and `X_k = U_k Σ_k Vt_k` (top-k singular values only), then for *any* other rank-k matrix `B`:
+> ```
+> ‖X − X_k‖_F  ≤  ‖X − B‖_F
+> ```
+> The truncated SVD is not just *a* good rank-k approximation — it is the **uniquely best one**.  No other choice of k basis vectors and k coefficients can reconstruct X with lower MSE.  This is why SVD is the theoretical ceiling for any linear patch-based compression method: PCA, random projections, hand-crafted wavelets are all at best equal to SVD at the same k.  It also explains why forcing a square submatrix cannot help — that is just a specific rank-k approximation, and Eckart-Young already beats every alternative.
+
+**What the matrix shape does affect.**
+The rank of X is bounded by `min(n_patches, P³)`.  With the current short-wide regime, Vt has at most 729 rows — a **729-dimensional subspace** of the 19,683-dimensional patch space (3.7% coverage).  A square matrix with `n_patches = P³` would give a *complete* orthogonal basis spanning all of patch space.  The distinction matters for **generalization** (compressing unseen patches / other timesteps), not for compressing the exact patches X was built from.
+
+**For a single-volume compression task** the current rectangular SVD is already optimal — it finds the best 729 directions for *this* data.  For a **universal dictionary** (multi-volume or streaming) you want `n_patches >> P³`, which requires smaller P.  With P=9 and a 256³ volume: 28³ ≈ 21,952 patches of 729 dimensions each → X is `(21,952 × 729)` — tall and thin, statistically stable, complete basis.
+
+**What actually determines compression quality: singular value decay.**
+Fast decay (few large singular values dominate) means small k is sufficient.  Fast decay happens when patches have strong spatial correlations (smooth fields like pressure → yes) and P is large enough to capture the field's correlation length.  Forcing a square submatrix by dropping columns from X strictly discards information and cannot beat the full rectangular SVD.
+
+| Regime | X shape | Basis | Good for |
+|---|---|---|---|
+| n_patches < P³ (current, P=27) | short and wide | incomplete — spans n_patches directions | single-volume compression (optimal for this data) |
+| n_patches ≈ P³ | square | complete orthogonal basis | generalizable dictionary |
+| n_patches > P³ (e.g., P=9) | tall and thin | complete, statistically stable | multi-volume / streaming compression |
+
+**Practical takeaway:** to move from the underdetermined (short-wide) to the overdetermined (tall-thin) regime without collecting more data, reduce P until `(D//P)³ ≥ P³`, i.e., `P ≤ D^(1/2)`.  For D=256 that is `P ≤ 16`.  This is also the regime where SVD-initialized LCA (using Vt rows as atom seeds) is most meaningful, since the learned basis is complete and generalizes to unseen patches.
+
+## Alternatives to SVD rank-k approximation
+
+Eckart-Young is tight within its own constraints: **linear**, **rank-k** (dense coefficients), **L2 loss**, **fixed bits per coefficient**.  Every method that beats it attacks one of those four constraints.
+
+### 1. Sparsity — break the "dense k coefficients" constraint
+
+SVD always stores k coefficients per patch.  Sparse coding stores M > k atoms in the dictionary but activates only s ≪ M per patch.  If the signal is sparse in the learned dictionary you store far fewer numbers at the same reconstruction error.
+
+- **K-SVD** (Aharon et al. 2006): alternates between OMP sparse coding and SVD-based dictionary atom updates.  The dictionary is non-orthogonal and overcomplete.  At the same bit budget as SVD it achieves lower error; at the same error it uses fewer non-zeros.
+- **LCA / LASSO / Basis Pursuit**: same idea — L1-penalized sparse codes in an overcomplete dictionary.
+- **Why it can beat Eckart-Young**: Eckart-Young guarantees optimality among *all rank-k matrices*, but a sparse code in an overcomplete dictionary is not rank-k — it lives in a union of low-dimensional subspaces, a richer structure that L2 rank-k cannot access.
+
+LCA is precisely this approach.  The open question is whether LCA's Hebbian dictionary is as good as K-SVD's analytically updated one.
+
+### 2. Non-linearity — break the "linear" constraint
+
+A smooth pressure field lives on a low-dimensional manifold in voxel space; linear projections (PCA/SVD) can only slice it with hyperplanes.  Any non-linear encoder can follow that manifold instead.
+
+- **Autoencoders**: encoder E(x) → z, decoder D(z) → x̂.  A nonlinear encoder with the same bottleneck dimension k beats PCA/SVD because it bends the projection to follow the data manifold.
+- **Variational autoencoders (VAE)**: same, with a learned prior over the latent that enables entropy coding.
+- **Nonlinear ICA / normalizing flows**: learn invertible nonlinear transforms; the Jacobian structure enables exact likelihood.
+
+The cost: these require training data, have no closed-form solution, and are slow to train.
+
+### 3. Entropy coding — break the "fixed bits per coefficient" constraint
+
+Eckart-Young says nothing about how many bits each coefficient costs.  SVD naively stores all k coefficients at 32 bits each.  In reality SVD coefficients are not uniformly distributed — the first few dominate and the rest are small.  Entropy coding exploits this.
+
+- **Quantize + Huffman / arithmetic code**: allocate more bits to high-variance coefficients, fewer to small ones.  JPEG does exactly this with DCT coefficients.
+- **Rate-distortion optimal bit allocation**: allocate bits proportional to log(σᵢ²) — the same variance that SVD's singular values encode.
+- **Combined (transform + quantize + entropy code)**: how JPEG 2000, BPG, and VVC work; dramatically outperforms raw SVD with dense float32 storage.
+- **ZFP**: purpose-built for floating-point scientific data — fits a polynomial per block (like a local SVD), quantizes, and entropy codes.  Achieves significantly better rate-distortion than raw SVD on smooth fields.
+
+This is the cheapest win available on an already-trained LCA: entropy-coding the sparse COO stream costs nothing in retraining and typically yields 1.5–4× additional compression (already noted in the tweaks section below).
+
+### 4. Better loss — break the "L2" constraint
+
+Eckart-Young minimizes MSE.  MSE ignores long-range correlations and is not the right metric for many applications.
+
+- **Perceptual loss (LPIPS, SSIM)**: minimizing perceptual distance rather than pixel-wise L2 yields better-looking reconstructions at the same bit rate — used in learned image compression.
+- **GAN-based compression**: a discriminator forces the reconstruction onto the data manifold.  At high compression ratios this looks sharper than L2 but may hallucinate fine-scale structure.
+- **Physics-informed loss**: for simulation data, adding a PDE residual term penalizes reconstructions that violate known physics, which can guide the model toward physically consistent low-bit-rate codes.
+
+### 5. Implicit neural representations (INR) — bypass the patch paradigm entirely
+
+Instead of a linear transform, represent the field as a neural network f(x, y, z) → value.  The network weights are the compressed representation.  No patches, no dictionary — the network *is* the code.
+
+- **SIREN** (Implicit Neural Representations with Periodic Activations): a small MLP with sinusoidal activations fits smooth fields very well.
+- **COIN / COIN++**: overfit a tiny network to a single volume; the weights are the bitstream.
+- **NeRF-style for 3D fields**: demonstrated for turbulence data (Han & Wang 2022, Shen et al. 2023).
+
+For a smooth pressure field, a 50K-parameter network can represent a 256³ = 16.7M voxel volume at competitive quality — a 330× compression in parameter count before quantization.  Decoding is slow (one network forward pass per voxel query), but for offline storage that may be acceptable.
+
+### 6. Wavelet / multi-scale transforms — better energy compaction structure
+
+Wavelets exploit multi-scale structure across the whole volume.  They are a fixed (non-data-adaptive) transform, so they cannot beat SVD in the Eckart-Young sense for *this specific data*.  But their structured sparsity pattern enables far more efficient entropy coding, so in practice (at a fixed bit budget after coding) wavelets + arithmetic coding often outperform SVD + dense float32 storage.
+
+- **3D DWT (discrete wavelet transform)**: decomposes the volume into coarse + detail subbands.  Smooth fields concentrate almost all energy in the lowest-frequency subband; high-frequency coefficients are near zero and can be heavily quantized or discarded.
+
+### Summary
+
+| Method | Constraint broken | Beats SVD when… |
+|---|---|---|
+| Sparse coding (K-SVD, LCA) | dense coefficients | signal is sparse in an overcomplete dictionary |
+| Nonlinear autoencoder | linearity | data lies on a curved low-dimensional manifold |
+| Transform + entropy coding (ZFP, wavelet) | fixed bits/coefficient | coefficient distribution is highly non-uniform |
+| GAN / perceptual / physics-informed loss | L2 objective | physical quality matters more than MSE |
+| INR (SIREN, COIN) | patch paradigm entirely | field is globally smooth, decode speed is unimportant |
+
+For the pressure field the most actionable paths are: entropy-coding the LCA sparse codes (free, no retraining), and INR as a complementary experiment — the field is globally smooth and that is exactly where INR methods are most competitive against patch-based linear methods.
+
+---
+
 # Single Simulation Single Snapshop
 We take a single shop from a single simulation and do a few forward passes to optimize the Phi
 ### scripts used 
@@ -18,21 +122,38 @@ We take a single shop from a single simulation and do a few forward passes to op
 
 ### Results
 **Experiment:** `simmldc_2026-06-11_13-28-15`  
-**Config:** 64 atoms, kernel 7³, stride 4, patch 32³, λ warmup 0.05→0.55 (ep15–40, hold ep40–54), 2000 patches/epoch, t=15
-
-| Metric | Value |
-|---|---|
-| Sparsity (fraction zero) | 88.7% |
-| Relative recon error | 0.98% |
-| Active coefficients/patch | 3,718 / 32,768 |
-| L2 recon error | 160.13 |
-| L1 sparsity cost | 1,092.46 |
-| Final λ | 0.55 |
+**Config:** 64 atoms, kernel 7³, stride 4, patch 32³, λ warmup 0.05→0.55 (ep15–40, hold ep40–54), 
 
 **Observations:**
-- Reconstruction fidelity is excellent at 0.98% relative error — significantly better than the CIFAR case, likely because a single pressure snapshot is a much more homogeneous and structured field than natural images.
-- Dictionary atoms (mid-plane slices of 7³ kernels) show diverse gradient and edge-like filters oriented along all three spatial directions, consistent with the smooth, slowly-varying pressure structures in isotropic turbulence.
-- Recon error column in the reconstruction plots is nearly blank, confirming the sparse code is capturing most of the variance.
+- LLCA lca_sim_mldc_SingleSnapshot -> for fix kernel (3) bigger patch size, lower rel_err, bigger comp(vals)
+-  
+
+**On the structural difference between LCA kernel_size and SVD patch_size:**
+
+SVD and convolutional LCA operate at fundamentally different granularities, even when they share the same `patch_size`:
+
+- **SVD** decomposes the entire P³ patch as one unit. Each basis vector (row of Vt) is P³-dimensional; each patch receives k dense scalar coefficients.
+- **LCA (convolutional, kernel_size=9, stride=3, patch_size=27):** each atom is 9³=729-dimensional and slides across the 27³ patch at (27/3)³=729 positions. Each patch can produce up to `features × 729` coefficients, a sparse subset of which are active.
+
+These are two different levels of abstraction: SVD captures global patch structure; convolutional LCA captures local sub-patch features that repeat across spatial positions.
+
+**For a direct apples-to-apples comparison with SVD**, set `kernel_size = patch_size = stride` (non-overlapping, fully-connected mode):
+
+```yaml
+kernel_size: 27   # odd ✓; atoms are 27³ = 19,683-dim — same dimensionality as SVD basis vectors
+stride:      27   # one code position per patch; no spatial sliding
+patch_size:  27   # training crop = one kernel application
+```
+
+This gives each patch exactly `features` possible activations (sparse subset active), directly comparable to SVD's k dense coefficients. The compression metric `P³ / avg_active` then matches the form of SVD's `P³ / k`.
+
+The current `kernel_size=9` configuration is a richer but structurally different representation: atoms are 729-voxel local features shared across many spatial positions. It can capture repeating local structure more parameter-efficiently but cannot be read as a direct SVD analogue.
+
+| Config | Atom size | Positions/patch | Structure | SVD-comparable? |
+|---|---|---|---|---|
+| `k=27, s=27` | 27³ = 19,683 | 1 | fully-connected | ✓ |
+| `k=9, s=3` (current) | 9³ = 729 | 9³ = 729 | convolutional | ✗ (different level) |
+| `k=9, s=9` | 9³ = 729 | 3³ = 27 | non-overlapping conv | partial |
 
 ### WARP-LCA: Warm-started LCA with CNN Predictor
 #### scripts used
@@ -208,3 +329,9 @@ Larger stride reduces code positions per patch (18³ → 9³ for stride 4→8), 
 # Single Simulation Multiple Snapshops
 
 # Multiple Simulations 
+
+# Notes from Meeting 
+
+- Laso svd
+- Smaller patches
+- Sparce coding

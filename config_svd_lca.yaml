@@ -5,20 +5,20 @@ data:
   h5_path:   "/data/mldc/pde_bench/Turb_M1.hdf5"
   field_key: "pressure"
   timestep:  15          # index into the nt dimension (0-based → physical t=16)
-  patch_size:  126    # 3D patch side length; must be divisible by stride (63 = 21×3 = 7×9)
-  n_patches:  8       # virtual epoch size (random crops per epoch)
+  patch_size: 3       # 3D patch side length; must be divisible by stride
+  n_patches:  1000       # virtual epoch size (random crops per epoch)
   batch_size: 16
   num_workers: 4
 
 model:
   features:     32
   in_channels:  1        # scalar field (pressure)
-  kernel_size:  3        # must be odd
-  stride:       3       # output: (27/3)³ = 9³ = 729 code positions/patch; must divide patch_size
-  lambda_:      0.1
+  kernel_size:  9        # must be odd
+  stride:       3        # output: (27/3)³ = 9³ = 729 code positions/patch; must divide patch_size
+  lambda_:      0.05
   tau:          100
   lca_iters:    1000
-  learning_rate: 0.1
+  learning_rate: 0.01
 
 training:
   max_epochs: 400           # safety cap — training stops earlier via rel_err logic

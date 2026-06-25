@@ -13,6 +13,7 @@ Usage — N GPUs (e.g. 4):
     torchrun --nproc_per_node=4 lca_sim_mldc.py [config_simmldc.yaml]
 """
 
+import argparse
 import os
 import shutil
 import sys
@@ -125,9 +126,16 @@ def main():
     is_main = (rank == 0)
 
     # ------------------------------------------------------------------ #
-    # Config
+    # Args + Config
     # ------------------------------------------------------------------ #
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else 'config_simmldc.yaml'
+    parser = argparse.ArgumentParser(description='LCAConv3D single-snapshot training')
+    parser.add_argument('config', nargs='?', default='config_simmldc.yaml',
+                        help='path to config YAML (default: config_simmldc.yaml)')
+    parser.add_argument('--load-model', default=None, metavar='PATH',
+                        help='path to a .pth checkpoint to pre-load the dictionary '
+                             '(e.g. experiments/simmldc_.../models/lca_simmldc_best_compression.pth)')
+    args = parser.parse_args()
+    cfg_path = args.config
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -223,6 +231,12 @@ def main():
         track_metrics = False,
         return_vars  = ['inputs', 'acts', 'recons', 'recon_errors'],
     ).to(dtype=dtype, device=device)
+
+    if args.load_model is not None:
+        ckpt = torch.load(args.load_model, map_location=device)
+        lca.load_state_dict(ckpt)
+        if is_main:
+            print(f"Loaded pre-trained dictionary: {args.load_model}")
 
     if using_ddp:
         dist.broadcast(lca.weights.data, src=0)
@@ -337,6 +351,7 @@ def main():
         avg_active   = ep_active / nb
         bytes_sparse = avg_active * _bytes_per_nz
         comp_ratio   = _bytes_in / bytes_sparse if bytes_sparse > 0 else float('inf')
+        comp_coeff   = mcfg['features'] / avg_active if avg_active > 0 else float('inf')
         bpv          = bytes_sparse * 8 / _P**3
 
         if is_main:
@@ -353,7 +368,7 @@ def main():
                 f"Rel.err: {avg_rel_err:.6f}  "
                 f"L2: {ep_l2/nb:.4f}  L1: {ep_l1/nb:.4f}  "
                 f"Energy: {ep_energy/nb:.4f}  λ={lca_inner.lambda_:.3f}  "
-                f"CompRatio: {comp_ratio:.2f}x  BPV: {bpv:.2f}"
+                f"Comp(feat): {comp_coeff:.4f}x  CompRatio: {comp_ratio:.2f}x  BPV: {bpv:.2f}"
                 + mode_tag
             )
             torch.save(lca_inner.state_dict(), os.path.join(models_dir, 'lca_simmldc.pth'))
@@ -364,7 +379,7 @@ def main():
                 best_lambda     = lca_inner.lambda_
                 torch.save(lca_inner.state_dict(),
                            os.path.join(models_dir, 'lca_simmldc_best_compression.pth'))
-                print(f"  [best] CompRatio={best_comp_ratio:.2f}x  "
+                print(f"  [best] Comp(feat)={comp_coeff:.4f}x  CompRatio={best_comp_ratio:.2f}x  "
                       f"λ={best_lambda:.3f}  rel_err={avg_rel_err:.4f}  BPV={bpv:.2f}")
 
         last_avg_rel_err = avg_rel_err
@@ -409,9 +424,11 @@ def main():
         ).mean().item()
         k = mcfg['kernel_size']
         print(f"\n=== LCAConv3D ({mcfg['features']} atoms, kernel {k}³, λ={lca_inner.lambda_:.3f}) ===")
+        comp_coeff_final = mcfg['features'] / active if active > 0 else float('inf')
         print(f"  Sparsity (fraction zero):  {sparsity:.3f}")
         print(f"  Relative recon error:      {rel_err:.6f}")
         print(f"  Active coefficients/item:  {active:.1f} / {n_total}")
+        print(f"  Comp(feat) [features/active]: {comp_coeff_final:.4f}x")
         print(f"  Energy (L2 + L1):          {all_energy[-1]:.4f}  "
               f"(first batch: {all_energy[0]:.4f})")
 
@@ -476,36 +493,61 @@ def main():
         plt.close()
         print(f"Saved {out}")
 
-        # Plot 3 — reconstruction examples (mid-plane slices of last batch)
-        def mid_slice(t):
-            # t: (C, D, H, W) tensor → 2D array at mid-depth
-            arr = t.float().cpu().numpy()[0, t.shape[1] // 2]  # (H, W)
-            return arr
+        # Plot 3 — full-volume reconstruction (3 orthogonal mid-plane slices)
+        vol_np  = dset.vol.numpy()                  # (D, H, W), already normalised
+        D, H, W = vol_np.shape
+        nD, nH, nW = D // _P, H // _P, W // _P
+        D_out, H_out, W_out = nD * _P, nH * _P, nW * _P
 
-        n = min(cfg['output']['n_images'], inputs.shape[0])
-        fig, axes = plt.subplots(n, 3, figsize=(6, 2 * n))
-        if n == 1:
-            axes = axes[np.newaxis, :]
-        axes[0, 0].set_title('Input (mid-slice)')
-        axes[0, 1].set_title('Reconstruction')
-        axes[0, 2].set_title('Recon Error')
-        for i in range(n):
-            inp_s  = mid_slice(recon[i] + recon_error[i])
-            rec_s  = mid_slice(recon[i])
-            err_s  = mid_slice(recon_error[i])
-            vmax_i = np.percentile(np.abs(inp_s), 99)
-            for ax, data in zip(axes[i], [inp_s, rec_s, err_s]):
-                ax.imshow(data, cmap='RdBu_r', vmin=-vmax_i, vmax=vmax_i)
-                ax.axis('off')
+        input_vol = vol_np[:D_out, :H_out, :W_out].copy()
+        recon_vol = np.zeros((D_out, H_out, W_out), dtype=np.float32)
+
+        tiles = [(di*_P, hi*_P, wi*_P)
+                 for di in range(nD) for hi in range(nH) for wi in range(nW)]
+
+        with torch.no_grad():
+            bs = min(len(tiles), 64)                    # fill GPU; ignore training batch_size
+            for start in range(0, len(tiles), bs):
+                batch_coords = tiles[start:start + bs]
+                batch = torch.stack([
+                    torch.from_numpy(vol_np[x:x+_P, y:y+_P, z:z+_P]).unsqueeze(0)
+                    for x, y, z in batch_coords
+                ]).to(dtype=dtype, device=device)       # (B, 1, P, P, P)
+                _, _, recon_batch, _ = lca_inner(batch)
+                recon_np = recon_batch.float().cpu().numpy()
+                for i, (x, y, z) in enumerate(batch_coords):
+                    recon_vol[x:x+_P, y:y+_P, z:z+_P] = recon_np[i, 0]
+
+        mD, mH, mW = D_out // 2, H_out // 2, W_out // 2
+        plane_defs = [
+            ('XY (z=mid)', input_vol[:, :, mW],  recon_vol[:, :, mW]),
+            ('XZ (y=mid)', input_vol[:, mH, :],  recon_vol[:, mH, :]),
+            ('YZ (x=mid)', input_vol[mD, :, :],  recon_vol[mD, :, :]),
+        ]
+
+        fig, axes = plt.subplots(2, 3, figsize=(14, 9))
         fig.suptitle(
-            f'Reconstructions  |  t={dcfg["timestep"]}  '
-            f'rel_err={avg_rel_err:.4f}  '
+            f'LCA full-volume reconstruction  |  {mcfg["features"]} atoms  '
+            f'λ={lca_inner.lambda_:.3f}  rel_err={avg_rel_err:.4f}  '
             f'CompRatio={comp_ratio:.2f}x  BPV={bpv:.2f}',
-            fontsize=9
+            fontsize=10
         )
+        for col, (lbl, inp_p, rec_p) in enumerate(plane_defs):
+            vmax = np.percentile(np.abs(inp_p), 99)
+            for row, (data, row_lbl) in enumerate([(inp_p, 'Input'), (rec_p, 'Reconstruction')]):
+                ax = axes[row, col]
+                im = ax.imshow(data, cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                               origin='lower', aspect='equal')
+                if row == 0:
+                    ax.set_title(lbl, fontsize=9)
+                if col == 0:
+                    ax.set_ylabel(row_lbl, fontsize=9)
+                ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+                plt.colorbar(im, ax=ax, shrink=0.85)
+
         plt.tight_layout()
-        out = os.path.join(plots_dir, 'reconstructions.png')
-        plt.savefig(out)
+        out = os.path.join(plots_dir, 'full_volume_reconstruction.png')
+        plt.savefig(out, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Saved {out}")
 
