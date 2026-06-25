@@ -17,7 +17,7 @@ model:
   stride:       3        # output: (27/3)³ = 9³ = 729 code positions/patch; must divide patch_size
   lambda_:      0.05
   tau:          100
-  lca_iters:    1000
+  lca_iters:    300   #This is for experimental purporses, use > 500 in practice
   learning_rate: 0.01
 
 training:

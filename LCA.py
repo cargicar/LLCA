@@ -24,6 +24,9 @@ Usage
     python LCA.py config_simmldc.yaml --lambda-values 0.05 0.1 0.2 0.5
     python LCA.py config_simmldc.yaml --lambda-min 0.01 --lambda-max 2.0
     python LCA.py config_simmldc.yaml --atoms 256 --lca-iters 500
+    python LCA.py config_simmldc.yaml --atoms-multiplier 4   # M = 4 × P³
+    python LCA.py config_simmldc.yaml --svd-init             # Phi from SVD of X
+    python LCA.py config_simmldc.yaml --patch-size 9         # override config patch_size
     python LCA.py config_simmldc.yaml --dict experiments/phi.npy
     python LCA.py config_simmldc.yaml --svd-bpv 3.5 --svd-rel-err 0.0098
     python LCA.py config_simmldc.yaml --output-dir results/lca_naked
@@ -153,13 +156,38 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 def init_dictionary(P3: int, M: int, seed: int = 42) -> np.ndarray:
-    """
-    Random Gaussian dictionary: (P³, M) columns, each unit-norm.
-    This is the standard random initialisation used in sparse coding papers.
-    """
+    """Random Gaussian dictionary: (P³, M) unit-norm columns."""
     rng = np.random.default_rng(seed)
     Phi = rng.standard_normal((P3, M)).astype(np.float32)
     Phi /= np.linalg.norm(Phi, axis=0, keepdims=True) + 1e-12
+    return Phi
+
+
+def init_dictionary_svd(X: np.ndarray, M: int) -> np.ndarray:
+    """
+    Initialize Phi from the top singular vectors of the patch matrix X.
+
+    Uses eigendecomposition of X.T @ X (P³×P³), which is efficient when
+    P³ << n_patches.  With signed codes and lambda_=0 this gives reconstruction
+    error equal to SVD truncated at min(M, P³) — the theoretical optimum.
+
+    If M > P³, the extra atoms are random vectors orthogonalized against the
+    SVD basis so they span the null space of X.
+    """
+    P3 = X.shape[1]
+    k  = min(M, P3)
+
+    XtX = (X.T.astype(np.float64) @ X.astype(np.float64)).astype(np.float32)
+    _, V = np.linalg.eigh(XtX)          # ascending eigenvalues, columns = eigenvectors
+    Phi  = V[:, -k:][:, ::-1].astype(np.float32)   # (P3, k), descending order
+
+    if M > k:
+        rng   = np.random.default_rng(42)
+        extra = rng.standard_normal((P3, M - k)).astype(np.float32)
+        extra -= Phi @ (Phi.T @ extra)               # orthogonalize vs SVD atoms
+        extra /= np.linalg.norm(extra, axis=0, keepdims=True) + 1e-12
+        Phi   = np.concatenate([Phi, extra], axis=1)
+
     return Phi
 
 
@@ -167,50 +195,58 @@ def init_dictionary(P3: int, M: int, seed: int = 42) -> np.ndarray:
 # Naked LCA  (Rozell et al. 2008, Section II)
 # ---------------------------------------------------------------------------
 
+def precompute_drives(
+    X: np.ndarray,
+    Phi_t: torch.Tensor,   # (P³, M) already on device
+    batch_size: int,
+) -> torch.Tensor:
+    """
+    Project all patches onto the dictionary: B = X @ Phi.
+
+    B is independent of lambda_ — compute once and reuse across the sweep.
+    Batched to keep GPU memory bounded for large P³.
+    """
+    n      = X.shape[0]
+    device = Phi_t.device
+    B_all  = torch.empty((n, Phi_t.shape[1]), dtype=torch.float32, device=device)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        B_all[start:end] = torch.from_numpy(X[start:end]).to(device) @ Phi_t
+    return B_all
+
+
 def lca_encode(
-    X: np.ndarray,       # (n_patches, P³) — normalised patches
-    Phi: np.ndarray,     # (P³, M) — dictionary, unit-norm columns
-    G: np.ndarray,       # (M, M) — Phi.T @ Phi − I (lateral inhibition)
+    B_all: torch.Tensor,   # (n_patches, M) — precomputed drives, already on device
+    G_t: torch.Tensor,     # (M, M) — lateral inhibition, already on device
     lambda_: float,
     tau: float,
     lca_iters: int,
-    device: torch.device,
     batch_size: int = 256,
-) -> tuple:
+) -> np.ndarray:
     """
-    Run the LCA dynamical system on all patches.
+    Run the LCA ODE from precomputed drives B.
 
         τ · Δu = B − U − A · G
-        A = T_λ(U)   [nonneg soft threshold: max(u − λ, 0)]
+        A = sign(U) · max(|U| − λ, 0)   [symmetric soft threshold]
 
-    Processed in mini-batches to bound GPU memory.
-
-    Returns
-    -------
-    A_all    : (n_patches, M)  float32 — sparse codes
+    Signed threshold allows negative codes, matching SVD's representational
+    capacity for zero-mean signals.  B = X @ Phi is precomputed once by
+    precompute_drives() and reused across all lambda_ values.
     """
-    n, P3 = X.shape
-    M = Phi.shape[1]
-
-    Phi_t  = torch.from_numpy(Phi).to(device)   # (P3, M)
-    G_t    = torch.from_numpy(G).to(device)      # (M, M)
-    A_all  = np.empty((n, M), dtype=np.float32)
-
-    dt = 1.0 / tau
+    n, M  = B_all.shape
+    A_all = np.empty((n, M), dtype=np.float32)
+    dt    = 1.0 / tau
 
     for start in range(0, n, batch_size):
-        end   = min(start + batch_size, n)
-        X_t   = torch.from_numpy(X[start:end]).to(device)   # (B, P3)
-        B     = X_t @ Phi_t                                  # (B, M) — input drive
-        U     = torch.zeros_like(B)
-
+        end = min(start + batch_size, n)
+        B   = B_all[start:end]
+        U   = torch.zeros_like(B)
         for _ in range(lca_iters):
-            A     = torch.clamp(U - lambda_, min=0.0)        # nonneg soft threshold
-            inhib = A @ G_t                                   # (B, M)
-            U     = U + dt * (B - U - inhib)
-
-        A = torch.clamp(U - lambda_, min=0.0)
-        A_all[start:end] = A.cpu().numpy()
+            A = torch.sign(U) * torch.clamp(torch.abs(U) - lambda_, min=0.0)
+            U = U + dt * (B - U - A @ G_t)
+        A_all[start:end] = (
+            torch.sign(U) * torch.clamp(torch.abs(U) - lambda_, min=0.0)
+        ).cpu().numpy()
 
     return A_all
 
@@ -224,6 +260,9 @@ def lca_decode(A: np.ndarray, Phi: np.ndarray) -> np.ndarray:
 # Main
 # ---------------------------------------------------------------------------
 
+#-----------------------------------------------------------------
+# Usage: python LCA.py config_svd_lca.yaml --svd-init --atoms-multiplier 4 --patch-size 9 --lambda-max 2.0
+# --------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description='Naked LCA compression baseline')
     parser.add_argument('config', help='path to config_simmldc.yaml')
@@ -231,12 +270,20 @@ def main():
                         help='explicit lambda_ values (default: auto log-sweep)')
     parser.add_argument('--lambda-min', type=float, default=0.01,
                         help='min lambda_ for auto sweep (default: 0.01)')
-    parser.add_argument('--lambda-max', type=float, default=2.0,
+    parser.add_argument('--lambda-max', type=float, default=1.0,
                         help='max lambda_ for auto sweep (default: 2.0)')
     parser.add_argument('--n-lambda', type=int, default=20,
                         help='number of lambda_ values in auto sweep (default: 20)')
     parser.add_argument('--atoms', type=int, default=None,
                         help='number of dictionary atoms M (default: from config features)')
+    parser.add_argument('--atoms-multiplier', type=int, default=None, metavar='K',
+                        help='set M = K × P³ (e.g. 4 for 4× overcomplete); '
+                             'ignored when --atoms is set')
+    parser.add_argument('--patch-size', type=int, default=None,
+                        help='override patch_size from config')
+    parser.add_argument('--svd-init', action='store_true',
+                        help='initialize Phi from SVD of the patch data '
+                             '(optimal for lambda_=0; use with --svd-init for fair SVD comparison)')
     parser.add_argument('--lca-iters', type=int, default=None,
                         help='LCA ODE iterations (default: from config lca_iters)')
     parser.add_argument('--tau', type=float, default=None,
@@ -258,9 +305,14 @@ def main():
 
     dcfg = cfg['data']
     mcfg = cfg['model']
-    P    = dcfg['patch_size']
+    P    = args.patch_size or dcfg['patch_size']
     P3   = P**3
-    M         = args.atoms    or mcfg['features']
+    if args.atoms:
+        M = args.atoms
+    elif args.atoms_multiplier:
+        M = args.atoms_multiplier * P3
+    else:
+        M = mcfg['features']
     lca_iters = args.lca_iters or mcfg['lca_iters']
     tau       = args.tau      or mcfg['tau']
 
@@ -287,12 +339,17 @@ def main():
     sys.stdout = _Tee(sys.__stdout__, _log)
     sys.stderr = _Tee(sys.__stderr__, _log)
 
-    dict_label = os.path.basename(args.dict) if args.dict else 'random init'
+    if args.dict:
+        dict_label = os.path.basename(args.dict)
+    elif args.svd_init:
+        dict_label = 'SVD init'
+    else:
+        dict_label = 'random init'
     print(f"Output dir  : {out_dir}")
     print(f"Config      : {args.config}")
     print(f"Patch size  : {P}³ = {P3:,} voxels")
     print(f"Atoms (M)   : {M}   (overcompleteness: {M/P3:.3f}x)")
-    print(f"LCA         : iters={lca_iters}  tau={tau}")
+    print(f"LCA         : iters={lca_iters}  tau={tau}  threshold=signed")
     print(f"Device      : {device}")
     print(f"Dictionary  : {dict_label}\n")
 
@@ -327,6 +384,13 @@ def main():
         assert Phi.shape == (P3, M), \
             f"Dictionary shape mismatch: expected ({P3}, {M}), got {Phi.shape}"
         print(f"Loaded Φ from {args.dict}  shape={Phi.shape}\n")
+    elif args.svd_init:
+        print(f"Computing SVD of X ({X.shape}) to initialise Φ ...")
+        t0  = time.time()
+        Phi = init_dictionary_svd(X, M)
+        phi_path = os.path.join(out_dir, 'phi_svd.npy')
+        np.save(phi_path, Phi)
+        print(f"  Φ shape={Phi.shape}  ({time.time()-t0:.1f}s)  saved → {phi_path}\n")
     else:
         Phi = init_dictionary(P3, M)
         phi_path = os.path.join(out_dir, 'phi_random.npy')
@@ -345,6 +409,18 @@ def main():
     _bytes_per_nz = 4 + (_index_bits + 7) // 8
     print(f"Index bits  : {_index_bits}  →  {_bytes_per_nz} bytes/nz (COO, range M={M})\n")
 
+    # Transfer Phi and G to GPU once — reused for all lambda values
+    Phi_t = torch.from_numpy(Phi).to(device)
+    G_t   = torch.from_numpy(G).to(device)
+
+    # Precompute B = X @ Phi (input drives) once — independent of lambda_
+    print("Precomputing B = X @ Φ  (once for all λ) ...")
+    t0    = time.time()
+    B_all = precompute_drives(X, Phi_t, args.batch_size)
+    print(f"  shape={tuple(B_all.shape)}  "
+          f"{B_all.numel()*4/1024/1024:.1f} MB on {device}  "
+          f"({time.time()-t0:.1f}s)\n")
+
     # ------------------------------------------------------------------ #
     # Lambda sweep
     # ------------------------------------------------------------------ #
@@ -352,6 +428,9 @@ def main():
         lambda_values = sorted(args.lambda_values)
     else:
         lambda_values = np.geomspace(args.lambda_min, args.lambda_max, args.n_lambda).tolist()
+
+    if 0.0 not in lambda_values:
+        lambda_values = [0.0] + lambda_values
 
     results = []
     print(f"{'lambda':>8}  {'avg_active':>12}  {'rel_err':>10}  {'PSNR(dB)':>10}  "
@@ -361,7 +440,7 @@ def main():
 
     for lam in lambda_values:
         t0 = time.time()
-        A = lca_encode(X, Phi, G, lam, tau, lca_iters, device, args.batch_size)
+        A = lca_encode(B_all, G_t, lam, tau, lca_iters, args.batch_size)
         elapsed = time.time() - t0
 
         avg_active = float((A != 0).sum(axis=1).mean())
@@ -510,8 +589,7 @@ def main():
     # ------------------------------------------------------------------ #
     # Plot 4 — full-volume reconstruction at best lambda  (mirrors SVD Plot 4)
     # ------------------------------------------------------------------ #
-    A_best     = lca_encode(X, Phi, G, best['lambda_'], tau, lca_iters,
-                             device, args.batch_size)
+    A_best     = lca_encode(B_all, G_t, best['lambda_'], tau, lca_iters, args.batch_size)
     recon_flat = lca_decode(A_best, Phi)
     recon_vol  = reconstruct_volume(
         recon_flat, means, stds, positions, (D_out, H_out, W_out), P
