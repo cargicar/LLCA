@@ -30,11 +30,11 @@ range is k (small) vs LCA's n_code_patch = features × (P//stride)³ (large → 
 
 Usage
 -----
-    python svd_compression.py config_simmldc.yaml
-    python svd_compression.py config_simmldc.yaml --k-max 60
-    python svd_compression.py config_simmldc.yaml --k-values 5 10 20 50
-    python svd_compression.py config_simmldc.yaml --lca-bpv 3.5 --lca-rel-err 0.0098
-    python svd_compression.py config_simmldc.yaml --output-dir results/svd_run1
+    python svd_compression.py config_svd_lca.yaml
+    python svd_compression.py config_svd_lca.yaml --k-max 60
+    python svd_compression.py config_svd_lca.yaml --k-values 5 10 20 50
+    python svd_compression.py config_svd_lca.yaml --lca-bpv 3.5 --lca-rel-err 0.0098
+    python svd_compression.py config_svd_lca.yaml --output-dir results/svd_run1
 """
 
 import argparse
@@ -114,6 +114,7 @@ def reconstruct_volume(
 
     for idx, (x, y, z) in enumerate(positions):
         patch_norm = coeffs[idx] @ Vt_k          # (P³,)
+        breakpoint()
         patch = patch_norm * stds[idx] + means[idx]
         recon_vol[x:x+P, y:y+P, z:z+P] = patch.reshape(P, P, P)
 
@@ -266,6 +267,7 @@ def main():
     else:
         # Full SVD then truncate — works since n_patches << P³
         U_full, s_full, Vt_full = np.linalg.svd(X, full_matrices=False)
+        breakpoint()
         U, s, Vt = U_full[:, :k_max], s_full[:k_max], Vt_full[:k_max]
 
     # Pre-compute all projections (n_patches, k_max) — cheap since k_max is small

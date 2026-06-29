@@ -107,8 +107,204 @@ class _Tee:
 
 
 # ---------------------------------------------------------------------------
+# Inference helper (Option 1 — context padding)
+# ---------------------------------------------------------------------------
+
+def _run_inference(args, cfg, lca, vol_np, device, dtype, out_dir):
+    """
+    Tile vol_np into infer_P³ tiles, inflate each by `pad` voxels on every
+    side using real neighbouring data, run LCA, keep only the central P³ of
+    the reconstruction.  Saves plots, metrics CSV, and run.log inside out_dir.
+    """
+    import csv
+
+    mcfg   = cfg['model']
+    stride = mcfg['stride']
+    K      = mcfg['kernel_size']
+    infer_P = args.infer_patch_size or cfg['data']['patch_size']
+
+    if infer_P % stride != 0:
+        raise ValueError(f"--infer-patch-size {infer_P} must be divisible by stride={stride}")
+
+    if args.infer_pad is not None:
+        pad = args.infer_pad
+        if pad % stride != 0:
+            raise ValueError(f"--infer-pad {pad} must be divisible by stride={stride}")
+    else:
+        pad = K // 2
+        if pad % stride != 0:
+            pad += stride - pad % stride   # round up to next multiple of stride
+
+    if args.infer_lambda is not None:
+        lca.lambda_ = args.infer_lambda
+
+    plots_dir = os.path.join(out_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    _log = open(os.path.join(out_dir, 'run.log'), 'w')
+
+    def log(msg=''):
+        line = msg + '\n'
+        sys.__stdout__.write(line)
+        _log.write(line)
+        _log.flush()
+
+    infer_full  = infer_P + 2 * pad
+    D, H, W     = vol_np.shape
+    nD, nH, nW  = D // infer_P, H // infer_P, W // infer_P
+    D_out, H_out, W_out = nD * infer_P, nH * infer_P, nW * infer_P
+    input_vol   = vol_np[:D_out, :H_out, :W_out].copy()
+
+    pp = pad    // stride   # code positions to skip per side
+    cp = infer_P // stride  # central code positions per side
+
+    log("Inference — Option 1 (context padding)")
+    log(f"  Source model   : {args.load_model}")
+    log(f"  Volume         : {D}×{H}×{W}  →  tiled {D_out}×{H_out}×{W_out}")
+    log(f"  Tile           : {infer_P}³  (trained on {cfg['data']['patch_size']}³)")
+    log(f"  Padding        : {pad} voxels/side  →  inflated {infer_full}³")
+    log(f"  Stride/kernel  : {stride} / {K}³")
+    log(f"  Tiles          : {nD}×{nH}×{nW} = {nD*nH*nW}")
+    log(f"  λ              : {lca.lambda_:.4f}")
+    log()
+
+    tiles        = [(di*infer_P, hi*infer_P, wi*infer_P)
+                    for di in range(nD) for hi in range(nH) for wi in range(nW)]
+    recon_vol    = np.zeros((D_out, H_out, W_out), dtype=np.float32)
+    total_active = 0.0
+    n_tiles      = len(tiles)
+
+    bs = min(n_tiles, 32)
+    with torch.no_grad():
+        for start in range(0, n_tiles, bs):
+            batch_coords = tiles[start:start + bs]
+            patches = []
+            for x, y, z in batch_coords:
+                x0, x1 = max(0, x - pad), min(D, x + infer_P + pad)
+                y0, y1 = max(0, y - pad), min(H, y + infer_P + pad)
+                z0, z1 = max(0, z - pad), min(W, z + infer_P + pad)
+                raw = vol_np[x0:x1, y0:y1, z0:z1]
+                patches.append(
+                    torch.from_numpy(
+                        np.pad(raw, [
+                            (pad - (x - x0), pad - (x1 - x - infer_P)),
+                            (pad - (y - y0), pad - (y1 - y - infer_P)),
+                            (pad - (z - z0), pad - (z1 - z - infer_P)),
+                        ])
+                    ).unsqueeze(0)
+                )
+
+            batch = torch.stack(patches).to(dtype=dtype, device=device)
+            _, code, recon_batch, _ = lca(batch)
+
+            recon_np = recon_batch.float().cpu().numpy()
+            for i, (x, y, z) in enumerate(batch_coords):
+                recon_vol[x:x+infer_P, y:y+infer_P, z:z+infer_P] = \
+                    recon_np[i, 0, pad:pad+infer_P, pad:pad+infer_P, pad:pad+infer_P]
+
+            central       = code[:, :, pp:pp+cp, pp:pp+cp, pp:pp+cp]
+            total_active += (central != 0).float().sum(dim=(1, 2, 3, 4)).sum().item()
+
+    avg_active = total_active / n_tiles
+
+    # Compression metrics (central code only — matches the stored infer_P³ tile)
+    _n_code_patch = mcfg['features'] * cp**3
+    _index_bits   = int(np.ceil(np.log2(_n_code_patch + 1)))
+    _bytes_per_nz = 4 + (_index_bits + 7) // 8
+    bytes_sparse  = avg_active * _bytes_per_nz
+    comp_coeff    = infer_P**3 / avg_active if avg_active > 0 else float('inf')
+    comp_ratio    = infer_P**3 * 4 / bytes_sparse if bytes_sparse > 0 else float('inf')
+    bpv           = bytes_sparse * 8 / infer_P**3
+
+    # Quality metrics (full volume)
+    err       = input_vol - recon_vol
+    mse       = float((err**2).mean())
+    rmse      = float(np.sqrt(mse))
+    rel_err   = rmse / (float(np.sqrt((input_vol**2).mean())) + 1e-8)
+    sig_range = float(input_vol.max() - input_vol.min())
+    psnr      = float(20 * np.log10(sig_range / (rmse + 1e-12)))
+
+    log(f"{'Metric':<26}  Value")
+    log('-' * 42)
+    log(f"{'rel_err':<26}  {rel_err:.6f}")
+    log(f"{'RMSE':<26}  {rmse:.6f}")
+    log(f"{'PSNR (dB)':<26}  {psnr:.2f}")
+    log(f"{'avg_active (central)':<26}  {avg_active:.1f} / {_n_code_patch}")
+    log(f"{'comp_coeff (P³/active)':<26}  {comp_coeff:.4f}x")
+    log(f"{'comp_ratio (bytes)':<26}  {comp_ratio:.4f}x")
+    log(f"{'BPV':<26}  {bpv:.3f}")
+    log()
+
+    csv_path = os.path.join(out_dir, 'inference_results.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'infer_patch_size', 'pad', 'lambda_', 'avg_active',
+            'rel_err', 'rmse', 'psnr', 'comp_coeff', 'comp_ratio', 'bpv',
+        ])
+        writer.writeheader()
+        writer.writerow(dict(
+            infer_patch_size=infer_P, pad=pad, lambda_=lca.lambda_,
+            avg_active=avg_active, rel_err=rel_err, rmse=rmse, psnr=psnr,
+            comp_coeff=comp_coeff, comp_ratio=comp_ratio, bpv=bpv,
+        ))
+    log(f"Saved {csv_path}")
+
+    mD, mH, mW = D_out // 2, H_out // 2, W_out // 2
+    plane_defs = [
+        ('XY (z=mid)', input_vol[:, :, mW], recon_vol[:, :, mW]),
+        ('XZ (y=mid)', input_vol[:, mH, :], recon_vol[:, mH, :]),
+        ('YZ (x=mid)', input_vol[mD, :, :], recon_vol[mD, :, :]),
+    ]
+
+    # Plot 1 — reconstruction
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
+    fig.suptitle(
+        f'LCA inference (pad={pad})  |  tile={infer_P}³  λ={lca.lambda_:.3f}  '
+        f'rel_err={rel_err:.4f}  Comp(P³)={comp_coeff:.2f}x  BPV={bpv:.2f}',
+        fontsize=10
+    )
+    for col, (lbl, inp_p, rec_p) in enumerate(plane_defs):
+        vmax = np.percentile(np.abs(inp_p), 99)
+        for row, (data, row_lbl) in enumerate([(inp_p, 'Input'), (rec_p, 'Reconstruction')]):
+            ax = axes[row, col]
+            im = ax.imshow(data, cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                           origin='lower', aspect='equal')
+            if row == 0:
+                ax.set_title(lbl, fontsize=9)
+            if col == 0:
+                ax.set_ylabel(row_lbl, fontsize=9)
+            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+            plt.colorbar(im, ax=ax, shrink=0.85)
+    plt.tight_layout()
+    p = os.path.join(plots_dir, f'reconstruction_tile{infer_P}_pad{pad}.png')
+    plt.savefig(p, dpi=150, bbox_inches='tight')
+    plt.close()
+    log(f"Saved {p}")
+
+    # Plot 2 — error maps
+    fig, axes_row = plt.subplots(1, 3, figsize=(14, 4))
+    for ax, (lbl, inp_p, rec_p) in zip(axes_row, plane_defs):
+        vmax = np.percentile(np.abs(inp_p), 99)
+        im   = ax.imshow(inp_p - rec_p, cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                         origin='lower', aspect='equal')
+        ax.set_title(f'Error {lbl}', fontsize=9)
+        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+        plt.colorbar(im, ax=ax, shrink=0.85)
+    fig.suptitle(f'Error maps  |  rel_err={rel_err:.4f}  PSNR={psnr:.1f} dB', fontsize=9)
+    plt.tight_layout()
+    p = os.path.join(plots_dir, f'error_maps_tile{infer_P}_pad{pad}.png')
+    plt.savefig(p, dpi=150)
+    plt.close()
+    log(f"Saved {p}")
+
+    log("\nDone.")
+    _log.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Usage Inference: python lca_sim_mldc_SingleSnaptshot.py config_simmldc.yaml  --load-model experiments/simmldc_2026-06-29_13-41-19/models/lca_simmldc_best_compression.pth  --infer  --infer-patch-size 9   --infer-lambda 0.15
 
 def main():
     # ------------------------------------------------------------------ #
@@ -134,6 +330,17 @@ def main():
     parser.add_argument('--load-model', default=None, metavar='PATH',
                         help='path to a .pth checkpoint to pre-load the dictionary '
                              '(e.g. experiments/simmldc_.../models/lca_simmldc_best_compression.pth)')
+    parser.add_argument('--infer', action='store_true',
+                        help='skip training; run context-padded (Option 1) inference only '
+                             '(requires --load-model)')
+    parser.add_argument('--infer-patch-size', type=int, default=None, metavar='P',
+                        help='tile size for inference; may differ from training patch_size '
+                             '(must be divisible by stride; default: patch_size from config)')
+    parser.add_argument('--infer-pad', type=int, default=None, metavar='N',
+                        help='context padding voxels per side (must be divisible by stride); '
+                             'default: auto = smallest multiple of stride ≥ kernel_size//2')
+    parser.add_argument('--infer-lambda', type=float, default=None, metavar='LAM',
+                        help='override lambda for inference (default: value from checkpoint)')
     args = parser.parse_args()
     cfg_path = args.config
     with open(cfg_path) as f:
@@ -142,31 +349,41 @@ def main():
     # ------------------------------------------------------------------ #
     # Experiment directory
     # ------------------------------------------------------------------ #
-    if is_main:
-        exp_dir = os.path.join(
-            'experiments', 'simmldc_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        )
+    if args.infer:
+        if args.load_model is None:
+            raise ValueError("--infer requires --load-model")
+        # Place inference output inside the source experiment dir
+        _src_exp   = os.path.dirname(os.path.dirname(os.path.abspath(args.load_model)))
+        exp_dir    = os.path.join(_src_exp, 'inference_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+        plots_dir  = os.path.join(exp_dir, 'plots')
+        models_dir = None
+        os.makedirs(plots_dir, exist_ok=True)
     else:
-        exp_dir = None
+        if is_main:
+            exp_dir = os.path.join(
+                'experiments', 'simmldc_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            )
+        else:
+            exp_dir = None
 
-    if using_ddp:
-        container = [exp_dir]
-        dist.broadcast_object_list(container, src=0)
-        exp_dir = container[0]
+        if using_ddp:
+            container = [exp_dir]
+            dist.broadcast_object_list(container, src=0)
+            exp_dir = container[0]
 
-    plots_dir  = os.path.join(exp_dir, 'plots')
-    models_dir = os.path.join(exp_dir, 'models')
+        plots_dir  = os.path.join(exp_dir, 'plots')
+        models_dir = os.path.join(exp_dir, 'models')
 
-    if is_main:
-        os.makedirs(plots_dir,  exist_ok=True)
-        os.makedirs(models_dir, exist_ok=True)
-        shutil.copy(cfg_path, os.path.join(exp_dir, 'config_simmldc.yaml'))
-        _log       = open(os.path.join(exp_dir, 'run.log'), 'w')
-        sys.stdout = _Tee(sys.__stdout__, _log)
-        sys.stderr = _Tee(sys.__stderr__, _log)
+        if is_main:
+            os.makedirs(plots_dir,  exist_ok=True)
+            os.makedirs(models_dir, exist_ok=True)
+            shutil.copy(cfg_path, os.path.join(exp_dir, 'config_simmldc.yaml'))
+            _log       = open(os.path.join(exp_dir, 'run.log'), 'w')
+            sys.stdout = _Tee(sys.__stdout__, _log)
+            sys.stderr = _Tee(sys.__stderr__, _log)
 
-    if using_ddp:
-        dist.barrier()
+        if using_ddp:
+            dist.barrier()
 
     # ------------------------------------------------------------------ #
     # dtype
@@ -243,6 +460,18 @@ def main():
 
     lca_ddp   = lca
     lca_inner = lca
+
+    # ------------------------------------------------------------------ #
+    # Inference mode — skip training entirely
+    # ------------------------------------------------------------------ #
+    if args.infer:
+        with h5py.File(dcfg['h5_path'], 'r') as fh:
+            _raw = fh[dcfg['field_key']][dcfg['timestep']].astype(np.float32)
+        vol_np = (_raw - _raw.mean()) / (_raw.std() + 1e-8)
+        _run_inference(args, cfg, lca_inner, vol_np, device, dtype, exp_dir)
+        if using_ddp:
+            cleanup_ddp()
+        return
 
     if is_main:
         k = mcfg['kernel_size']
@@ -351,7 +580,7 @@ def main():
         avg_active   = ep_active / nb
         bytes_sparse = avg_active * _bytes_per_nz
         comp_ratio   = _bytes_in / bytes_sparse if bytes_sparse > 0 else float('inf')
-        comp_coeff   = mcfg['features'] / avg_active if avg_active > 0 else float('inf')
+        comp_coeff   = _P**3 / avg_active if avg_active > 0 else float('inf')
         bpv          = bytes_sparse * 8 / _P**3
 
         if is_main:
@@ -368,7 +597,7 @@ def main():
                 f"Rel.err: {avg_rel_err:.6f}  "
                 f"L2: {ep_l2/nb:.4f}  L1: {ep_l1/nb:.4f}  "
                 f"Energy: {ep_energy/nb:.4f}  λ={lca_inner.lambda_:.3f}  "
-                f"Comp(feat): {comp_coeff:.4f}x  CompRatio: {comp_ratio:.2f}x  BPV: {bpv:.2f}"
+                f"Comp(P³): {comp_coeff:.4f}x  CompRatio: {comp_ratio:.2f}x  BPV: {bpv:.2f}"
                 + mode_tag
             )
             torch.save(lca_inner.state_dict(), os.path.join(models_dir, 'lca_simmldc.pth'))
@@ -379,7 +608,7 @@ def main():
                 best_lambda     = lca_inner.lambda_
                 torch.save(lca_inner.state_dict(),
                            os.path.join(models_dir, 'lca_simmldc_best_compression.pth'))
-                print(f"  [best] Comp(feat)={comp_coeff:.4f}x  CompRatio={best_comp_ratio:.2f}x  "
+                print(f"  [best] Comp(P³)={comp_coeff:.4f}x  CompRatio={best_comp_ratio:.2f}x  "
                       f"λ={best_lambda:.3f}  rel_err={avg_rel_err:.4f}  BPV={bpv:.2f}")
 
         last_avg_rel_err = avg_rel_err
@@ -424,11 +653,11 @@ def main():
         ).mean().item()
         k = mcfg['kernel_size']
         print(f"\n=== LCAConv3D ({mcfg['features']} atoms, kernel {k}³, λ={lca_inner.lambda_:.3f}) ===")
-        comp_coeff_final = mcfg['features'] / active if active > 0 else float('inf')
+        comp_coeff_final = _P**3 / active if active > 0 else float('inf')
         print(f"  Sparsity (fraction zero):  {sparsity:.3f}")
         print(f"  Relative recon error:      {rel_err:.6f}")
         print(f"  Active coefficients/item:  {active:.1f} / {n_total}")
-        print(f"  Comp(feat) [features/active]: {comp_coeff_final:.4f}x")
+        print(f"  Comp(P³) [P³/active]: {comp_coeff_final:.4f}x")
         print(f"  Energy (L2 + L1):          {all_energy[-1]:.4f}  "
               f"(first batch: {all_energy[0]:.4f})")
 

@@ -70,7 +70,7 @@ class _Tee:
 # Main
 # ---------------------------------------------------------------------------
 # Usage: # 4 GPUs, SVD init, 4× overcomplete:
-#torchrun --nproc_per_node=4 lca_ddp.py config_svd_lca.yaml --svd-init --atoms-multiplier 4 --patch-size 9
+# torchrun --nproc_per_node=4 lca_ddp.py config_svd_lca.yaml --svd-init --atoms-multiplier 4 --patch-size 9
 
 
 def main():

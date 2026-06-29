@@ -5,7 +5,7 @@ data:
   h5_path:   "/data/mldc/pde_bench/Turb_M1.hdf5"
   field_key: "pressure"
   timestep:  15          # index into the nt dimension (0-based → physical t=16)
-  patch_size: 3       # 3D patch side length; must be divisible by stride
+  patch_size: 9       # 3D patch side length; must be divisible by stride
   n_patches:  1000       # virtual epoch size (random crops per epoch)
   batch_size: 16
   num_workers: 4
@@ -27,7 +27,7 @@ training:
   lambda_anneal_every: 1
   lambda_anneal_step:  0.02
   dtype: "float32"
-  rel_err_target:   0.01   # rel_err threshold: hit it → stabilize → anneal → repeat
+  rel_err_target:   0.05   # rel_err threshold: hit it → stabilize → anneal → repeat
   rel_err_ceiling:  0.05   # λ increment is skipped if last epoch rel_err exceeded this; best checkpoint saved below this
   stabilize_epochs: 10     # epochs to freeze λ; done when anneal_stop reached + stabilized
 

@@ -120,6 +120,72 @@ We take a single shop from a single simulation and do a few forward passes to op
 - **`rel_err_ceiling` guard**: At the start of each annealing epoch, the previous epoch's `avg_rel_err` is checked against `rel_err_ceiling` (default 0.01 = 1%). If it exceeds the ceiling, the λ increment is skipped and logged — ensuring λ can only grow when the model is actually below the error budget.
 - **Best-compression checkpoint**: Every epoch where `avg_rel_err ≤ rel_err_ceiling` and the patch-level compression ratio is a new high, `lca_simmldc_best_compression.pth` is saved alongside the regular `lca_simmldc.pth`. This captures the highest compression achieved without ever violating the error budget, even if the final epoch overshoots it.
 
+### Convolutional Reconstruction: Border Effects and Fixes
+
+**Root cause — blocking artifacts with small patches:**
+With non-overlapping tiles, atoms near each tile boundary see zero-padded input instead of real neighboring voxels. With a large patch (e.g. 126³), most voxels are far from boundaries so the artifact is diluted. With a small patch (e.g. 9³), the boundary fraction is huge and blocking artifacts dominate, causing rel_err to worsen relative to SVD.
+
+SVD is immune: its basis vectors are global (P³-dimensional), so there are no "border atoms". LCA's local kernels make it susceptible to tiling boundaries.
+
+**Three options (ordered by effectiveness):**
+
+**Option 1 — Context padding at inference (simplest, no training change)**
+
+For each tile, extract a slightly larger region (using real neighboring data), run LCA, discard the border of the reconstruction, keep only the central P³ voxels.
+
+```
+Extract: (P + 2·pad)³ from volume (actual neighbors, not zeros)
+Encode/decode the inflated tile
+Keep only: recon[pad:P+pad, pad:P+pad, pad:P+pad]
+```
+
+LCAConv3D is fully convolutional — it handles any input size. Constraint: `(P + 2·pad) % stride == 0`. For `kernel_size=3, stride=3`: pad=3 → inflate 9³ to 15³ (15 % 3 == 0), keep center 9³. Only the first/last tile at the volume boundary still sees zero-padding; all interior tiles are clean.
+
+**Option 2 — Overlap-add reconstruction (most effective)**
+
+Slide tiles with ~50% overlap, weight each reconstruction by a raised-cosine (Hann) window, accumulate, divide. Border contributions are naturally down-weighted to near zero.
+
+```python
+window = np.hanning(P)
+w3d = window[:, None, None] * window[None, :, None] * window[None, None, :]  # (P,P,P)
+# for each overlapping tile: recon_vol += w3d * tile_recon
+# weight_vol += w3d
+# final: recon_vol /= weight_vol
+```
+
+Step size = P//2. Each interior voxel is covered by 2³=8 overlapping tiles; the window guarantees no single tile's border dominates. Cost: ~8× more LCA calls than non-overlapping. Training unchanged.
+
+**Option 3 — Padding-aware training augmentation**
+
+During training, randomly crop patches that straddle natural tile boundaries (center the crop off-grid). Forces atoms to learn representations that work near edges. Best combined with Option 1 at inference.
+
+**Recommended path:** Start with Option 1 (context padding) — 10-line change to the reconstruction loop, no retraining, and for `kernel_size=3` a pad of 3–6 voxels is usually sufficient. If blocking is still visible, switch to Option 2.
+
+**Implementation — `--infer` flag in `lca_sim_mldc_SingleSnaptshot.py`**
+
+Option 1 is implemented as an inference-only mode. Pass `--infer` with any trained checkpoint to skip training entirely and run context-padded reconstruction on the full volume.
+
+```bash
+python lca_sim_mldc_SingleSnaptshot.py config_simmldc.yaml \
+    --load-model experiments/simmldc_2026-06-29_13-41-19/models/lca_simmldc_best_compression.pth \
+    --infer \
+    --infer-patch-size 9      # tile size (may differ from training patch_size)
+    --infer-pad 3             # optional; auto-computed if omitted
+    --infer-lambda 0.15       # optional lambda override
+```
+
+The model is fully convolutional so it accepts any input size divisible by `stride` — inference at `patch_size=9` on a model trained at `patch_size=126` is valid. The auto-pad rule is: smallest multiple of `stride` ≥ `kernel_size//2`. For `kernel_size=3, stride=3` this gives `pad=3`, inflating each 9³ tile to 15³.
+
+Output is saved inside the source experiment directory under `inference_{timestamp}/`:
+- `run.log` — metrics table
+- `inference_results.csv` — `infer_patch_size, pad, lambda_, avg_active, rel_err, rmse, psnr, comp_coeff, comp_ratio, bpv`
+- `plots/reconstruction_tile{P}_pad{pad}.png` — input vs reconstruction (3 orthogonal planes)
+- `plots/error_maps_tile{P}_pad{pad}.png` — signed error maps
+
+Compression metrics (`comp_coeff = P³/avg_active`, `bpv`) are computed from the **central code only** — the `(P//stride)³` code positions corresponding to the tile interior — so they are directly comparable to training-time metrics at the same tile size.
+
+---
+
 ### Results
 **Experiment:** `simmldc_2026-06-11_13-28-15`  
 **Config:** 64 atoms, kernel 7³, stride 4, patch 32³, λ warmup 0.05→0.55 (ep15–40, hold ep40–54), 
