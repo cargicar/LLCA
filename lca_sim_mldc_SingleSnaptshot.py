@@ -14,6 +14,7 @@ Usage — N GPUs (e.g. 4):
 """
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -304,7 +305,14 @@ def _run_inference(args, cfg, lca, vol_np, device, dtype, out_dir):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-# Usage Inference: python lca_sim_mldc_SingleSnaptshot.py config_simmldc.yaml  --load-model experiments/simmldc_2026-06-29_13-41-19/models/lca_simmldc_best_compression.pth  --infer  --infer-patch-size 9   --infer-lambda 0.15
+# Usage Inference:
+#   python lca_sim_mldc_SingleSnaptshot.py config_simmldc.yaml \
+#       --load-model experiments/simmldc_.../models/lca_simmldc_best_compression.pth \
+#       --infer --infer-patch-size 9 --infer-lambda 0.15
+#
+# Usage Resume (continues from the saved training state):
+#   python lca_sim_mldc_SingleSnaptshot.py config_simmldc.yaml \
+#       --resume experiments/simmldc_.../models/lca_simmldc_best_compression.pth
 
 def main():
     # ------------------------------------------------------------------ #
@@ -341,7 +349,19 @@ def main():
                              'default: auto = smallest multiple of stride ≥ kernel_size//2')
     parser.add_argument('--infer-lambda', type=float, default=None, metavar='LAM',
                         help='override lambda for inference (default: value from checkpoint)')
+    parser.add_argument('--resume', default=None, metavar='PATH',
+                        help='path to a .pth checkpoint to resume training from; '
+                             'restores epoch, λ, and annealing state from '
+                             'training_state.pth in the same directory')
+    parser.add_argument('--resume-lambda', type=float, default=None, metavar='LAM',
+                        help='override λ when resuming from an old checkpoint that does not '
+                             'embed lambda (e.g. --resume-lambda 0.060)')
     args = parser.parse_args()
+
+    # --resume implies --load-model for the same checkpoint
+    if args.resume is not None and args.load_model is None:
+        args.load_model = args.resume
+
     cfg_path = args.config
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
@@ -450,16 +470,52 @@ def main():
     ).to(dtype=dtype, device=device)
 
     if args.load_model is not None:
-        ckpt = torch.load(args.load_model, map_location=device)
-        lca.load_state_dict(ckpt)
-        if is_main:
-            print(f"Loaded pre-trained dictionary: {args.load_model}")
+        ckpt = torch.load(args.load_model, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+            lca.load_state_dict(ckpt['state_dict'])
+            embedded_lambda = ckpt.get('lambda_', None)
+            if embedded_lambda is not None:
+                lca.lambda_ = embedded_lambda
+                if is_main:
+                    print(f"Loaded pre-trained dictionary: {args.load_model}  "
+                          f"(embedded λ={embedded_lambda:.4f})")
+            else:
+                if is_main:
+                    print(f"Loaded pre-trained dictionary: {args.load_model}")
+        else:
+            lca.load_state_dict(ckpt)   # backward compat: old plain state_dict checkpoints
+            if is_main:
+                print(f"Loaded pre-trained dictionary (old format): {args.load_model}")
+        # --resume-lambda overrides everything — required for old checkpoints without embedded λ
+        if getattr(args, 'resume_lambda', None) is not None:
+            lca.lambda_ = args.resume_lambda
+            if is_main:
+                print(f"  λ overridden via --resume-lambda → {lca.lambda_:.4f}")
 
     if using_ddp:
         dist.broadcast(lca.weights.data, src=0)
 
     lca_ddp   = lca
     lca_inner = lca
+
+    # ------------------------------------------------------------------ #
+    # Resume — load training state saved alongside the checkpoint
+    # ------------------------------------------------------------------ #
+    saved_train_state = None
+    if args.resume is not None:
+        _state_path = os.path.join(
+            os.path.dirname(os.path.abspath(args.resume)), 'training_state.pth'
+        )
+        if os.path.isfile(_state_path):
+            saved_train_state = torch.load(_state_path, map_location='cpu', weights_only=False)
+            if is_main:
+                print(f"Loaded training state : {_state_path}")
+                print(f"  epoch={saved_train_state['epoch']}  "
+                      f"λ={saved_train_state['lambda_']:.4f}  "
+                      f"mode={saved_train_state['mode']}")
+        elif is_main:
+            print(f"[resume] No training_state.pth found at {_state_path} — "
+                  f"starting from epoch 0 with loaded weights")
 
     # ------------------------------------------------------------------ #
     # Inference mode — skip training entirely
@@ -476,7 +532,7 @@ def main():
     if is_main:
         k = mcfg['kernel_size']
         print(f"LCAConv3D : {mcfg['features']} atoms | "
-              f"kernel {k}³ | stride {mcfg['stride']} | λ={mcfg['lambda_']}\n")
+              f"kernel {k}³ | stride {mcfg['stride']} | λ={lca_inner.lambda_:.4f}\n")
 
     # ------------------------------------------------------------------ #
     # Training loop
@@ -508,9 +564,26 @@ def main():
     anneal_epoch      = 0    # epochs spent in 'anneal' mode (used for anneal_every and anneal_stop)
     last_avg_rel_err  = 0.0  # previous epoch's rel_err — used by ceiling guard
     best_comp_ratio   = 0.0  # tracks highest compression seen while rel_err <= ceiling
-    best_lambda       = mcfg['lambda_']
+    best_lambda       = lca_inner.lambda_  # use actual lambda, not config (may differ on resume)
 
-    for epoch in range(max_epochs):
+    # Restore full training state when --resume is used
+    start_epoch = 0
+    if saved_train_state is not None:
+        start_epoch       = saved_train_state['epoch'] + 1
+        lca_inner.lambda_ = saved_train_state['lambda_']
+        mode              = saved_train_state.get('mode', mode)
+        stab_count        = saved_train_state.get('stab_count', 0)
+        anneal_epoch      = saved_train_state.get('anneal_epoch', 0)
+        last_avg_rel_err  = saved_train_state.get('last_avg_rel_err', 0.0)
+        best_comp_ratio   = saved_train_state.get('best_comp_ratio', 0.0)
+        best_lambda       = saved_train_state.get('best_lambda', lca_inner.lambda_)
+        if is_main:
+            print(f"Resuming from epoch {saved_train_state['epoch']}  "
+                  f"λ={lca_inner.lambda_:.4f}  mode={mode}  "
+                  f"anneal_epoch={anneal_epoch}\n")
+
+    nan_exit = False
+    for epoch in range(start_epoch, max_epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
@@ -537,10 +610,24 @@ def main():
 
         ep_l2 = ep_l1 = ep_energy = ep_sparsity = ep_active = ep_rel_err = 0.0
 
-        for patches in dataloader:
+        consecutive_nan = 0
+        for _batch_idx, patches in enumerate(dataloader):
             patches = patches.to(dtype=dtype, device=device)  # (B, 1, P, P, P)
             inputs, code, recon, recon_error = lca_ddp(patches)
 
+            if torch.isnan(code).any() or torch.isnan(recon).any():
+                consecutive_nan += 1
+                if is_main:
+                    print(f"\n  [NaN] Forward pass NaN at epoch {epoch} batch {_batch_idx} "
+                          f"({consecutive_nan}/5 consecutive) — skipping weight update.")
+                if consecutive_nan >= 5:
+                    if is_main:
+                        print("  [NaN] 5 consecutive NaN batches — weights diverged, stopping.")
+                    nan_exit = True
+                    break
+                continue   # skip the update for this batch; try the next one
+
+            consecutive_nan = 0   # reset on any good batch
             lca_inner.update_weights(code, recon_error)
 
             if using_ddp:
@@ -573,11 +660,25 @@ def main():
                 (inputs.pow(2).sum(dim=(1, 2, 3, 4)) + 1e-8)
             ).mean().item()
 
+        if nan_exit:
+            break
+
         nb         = len(dataloader)
         epoch_time = time.time() - t0
 
         avg_rel_err  = ep_rel_err / nb
         avg_active   = ep_active / nb
+
+        # NaN guard — weights diverged (norm collapse in normalize_weights)
+        if math.isnan(avg_rel_err) or math.isnan(ep_l2 / nb):
+            nan_exit = True
+            if is_main:
+                print(f"\n  [NaN] Weights diverged at epoch {epoch} — stopping training.")
+                print(f"  Best checkpoint : {models_dir}/lca_simmldc_best_compression.pth")
+                print(f"  Resume with     : --resume {models_dir}/lca_simmldc_best_compression.pth "
+                      f"--resume-lambda {best_lambda:.4f}")
+            break
+
         bytes_sparse = avg_active * _bytes_per_nz
         comp_ratio   = _bytes_in / bytes_sparse if bytes_sparse > 0 else float('inf')
         comp_coeff   = _P**3 / avg_active if avg_active > 0 else float('inf')
@@ -600,13 +701,14 @@ def main():
                 f"Comp(P³): {comp_coeff:.4f}x  CompRatio: {comp_ratio:.2f}x  BPV: {bpv:.2f}"
                 + mode_tag
             )
-            torch.save(lca_inner.state_dict(), os.path.join(models_dir, 'lca_simmldc.pth'))
+            torch.save({'state_dict': lca_inner.state_dict(), 'lambda_': lca_inner.lambda_},
+                       os.path.join(models_dir, 'lca_simmldc.pth'))
 
             # best-compression checkpoint: highest comp_ratio seen while rel_err <= ceiling
             if avg_rel_err <= rel_err_ceiling and comp_ratio > best_comp_ratio:
                 best_comp_ratio = comp_ratio
                 best_lambda     = lca_inner.lambda_
-                torch.save(lca_inner.state_dict(),
+                torch.save({'state_dict': lca_inner.state_dict(), 'lambda_': lca_inner.lambda_},
                            os.path.join(models_dir, 'lca_simmldc_best_compression.pth'))
                 print(f"  [best] Comp(P³)={comp_coeff:.4f}x  CompRatio={best_comp_ratio:.2f}x  "
                       f"λ={best_lambda:.3f}  rel_err={avg_rel_err:.4f}  BPV={bpv:.2f}")
@@ -639,27 +741,41 @@ def main():
         if mode == 'anneal':
             anneal_epoch += 1
 
-    # ------------------------------------------------------------------ #
-    # Post-training output
-    # ------------------------------------------------------------------ #
-    if is_main:
-        print("\nTraining complete.")
+        # Save training state after every epoch so training can be resumed
+        if is_main:
+            torch.save({
+                'epoch':            epoch,
+                'lambda_':          lca_inner.lambda_,
+                'mode':             mode,
+                'stab_count':       stab_count,
+                'anneal_epoch':     anneal_epoch,
+                'last_avg_rel_err': last_avg_rel_err,
+                'best_comp_ratio':  best_comp_ratio,
+                'best_lambda':      best_lambda,
+            }, os.path.join(models_dir, 'training_state.pth'))
 
-        sparsity = (code == 0).float().mean().item()
-        active   = (code != 0).float().sum(dim=(1, 2, 3, 4)).mean().item()
-        rel_err  = (
-            (inputs - recon).pow(2).sum(dim=(1, 2, 3, 4)) /
-            (inputs.pow(2).sum(dim=(1, 2, 3, 4)) + 1e-8)
-        ).mean().item()
-        k = mcfg['kernel_size']
-        print(f"\n=== LCAConv3D ({mcfg['features']} atoms, kernel {k}³, λ={lca_inner.lambda_:.3f}) ===")
-        comp_coeff_final = _P**3 / active if active > 0 else float('inf')
-        print(f"  Sparsity (fraction zero):  {sparsity:.3f}")
-        print(f"  Relative recon error:      {rel_err:.6f}")
-        print(f"  Active coefficients/item:  {active:.1f} / {n_total}")
-        print(f"  Comp(P³) [P³/active]: {comp_coeff_final:.4f}x")
-        print(f"  Energy (L2 + L1):          {all_energy[-1]:.4f}  "
-              f"(first batch: {all_energy[0]:.4f})")
+    # ------------------------------------------------------------------ #
+    # Post-training output — runs whenever at least one epoch completed
+    # ------------------------------------------------------------------ #
+    if is_main and len(all_l2) > 0:
+        if nan_exit:
+            print(f"\nStopped early after {len(all_l2)} batches — generating plots.")
+            # Reload the best checkpoint so atoms/reconstruction plots are clean
+            _best_ckpt = os.path.join(models_dir, 'lca_simmldc_best_compression.pth')
+            if os.path.isfile(_best_ckpt):
+                _ckpt = torch.load(_best_ckpt, map_location=device, weights_only=False)
+                if isinstance(_ckpt, dict) and 'state_dict' in _ckpt:
+                    lca_inner.load_state_dict(_ckpt['state_dict'])
+                    lca_inner.lambda_ = _ckpt.get('lambda_', lca_inner.lambda_)
+                else:
+                    lca_inner.load_state_dict(_ckpt)
+                print(f"  Using best checkpoint for plots: λ={lca_inner.lambda_:.4f}")
+        else:
+            print("\nTraining complete.")
+            k = mcfg['kernel_size']
+            print(f"\n=== LCAConv3D ({mcfg['features']} atoms, kernel {k}³, λ={lca_inner.lambda_:.3f}) ===")
+            print(f"  Energy (L2 + L1):          {all_energy[-1]:.4f}  "
+                  f"(first batch: {all_energy[0]:.4f})")
 
         # Plot 1 — loss curves
         plot_start_epoch = cfg['output'].get('plot_start_epoch', 0)
@@ -781,6 +897,11 @@ def main():
         print(f"Saved {out}")
 
         print("\nDone.")
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        _log.close()
+    elif is_main:
+        # No training data at all — just close the log
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
         _log.close()

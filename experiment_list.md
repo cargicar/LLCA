@@ -221,6 +221,36 @@ The current `kernel_size=9` configuration is a richer but structurally different
 | `k=9, s=3` (current) | 9³ = 729 | 9³ = 729 | convolutional | ✗ (different level) |
 | `k=9, s=9` | 9³ = 729 | 3³ = 27 | non-overlapping conv | partial |
 
+### Best-guess configuration to beat SVD (2026-07-02)
+
+**Where LCA can actually beat SVD.** SVD/PCA is the provably optimal dense linear rank-k approximation for whatever patch ensemble it's fit on (Eckart-Young). No dense, no-sparsity method can beat it at equal k. LCA only has two structural levers that can get around that:
+
+1. **Sparse, adaptive support (union-of-subspaces vs. one fixed subspace).** An overcomplete dictionary lets each patch pick a *different* small subset of atoms. If the field has heterogeneous local statistics (laminar regions vs. vortex cores/shear layers in turbulence), this beats a single global rank-k subspace at the same coefficient budget — but only if the dictionary is overcomplete enough to offer real choices.
+2. **Convolutional weight-sharing across space.** A small kernel reused at many positions gets many implicit training examples per atom from one crop, and can exploit repeated local structure that a patch-level SVD basis (fixed pixel positions within P³) cannot.
+
+This means the FC config (`kernel_size=stride=patch_size=27`) is the wrong end of the spectrum to chase, even though it's the "fairest" apples-to-apples comparison. It throws away lever #2 entirely, and a 19,683-dim atom learned by Hebbian updates from a single snapshot is badly data-starved compared to what SVD needs to fit an equally-sized basis in closed form. FC mode is useful as a floor/ablation, not as the best shot at winning.
+
+**Recommended direction.**
+
+- **A. Moderate kernel, reduced overlap, overcomplete dictionary.** The current config (`K=9, S=3`) generates 729 code positions per 27³ patch — a huge grid to sparsify, and it isn't buying much: heavy overlap mostly re-encodes smoothness/redundancy the sparsity penalty then has to suppress. Pull stride up toward `K//2`–`K` (e.g. `S=5..9` for `K=9`) to cut position count ~10–100×, while keeping enough overlap to avoid block-seam artifacts (see border-effects section above). Simultaneously push `features` up (128–256 for `K=9`, i.e. 2–4× K³=729) so there's real overcomplete choice per position — that's what makes the sparse-support lever fire.
+- **B. Lean into the hybrid (`svd_lca_hybrid.py`) architecture rather than pure LCA.** Let SVD's optimal linear fit cheaply absorb the smooth, energy-dominant global modes at a small `k`, then run a compact overcomplete conv LCA dictionary on the residual only. Post-SVD residuals should be much closer to sparse/non-Gaussian, so very few active atoms per position should suffice — attacking `bytes_svd(small k) + bytes_lca(very sparse)` vs. a much larger standalone SVD `k` needed for the same rel_err. This is the highest-leverage path since the machinery already exists.
+
+| Config | kernel/stride | features | Where it sits |
+|---|---|---|---|
+| Current | 9/3 | 64 | too many positions, undercomplete |
+| Try 1 | 9/6 or 9/9 | 128–256 | fewer positions, overcomplete — pure LCA |
+| Try 2 (best bet) | SVD k~20-40 + LCA 9/6, 128 feat | — | hybrid, attacks residual only |
+| Floor/ablation | 27/27 | ≥512 | FC, directly SVD-comparable, expect it to lose |
+
+**On adding more snapshots — yes, and it changes what the comparison means.** Right now both methods fit-and-reconstruct the *same single snapshot* (`svd_lca_hybrid.py` builds its patch matrix `X` from one `vol`, same as the LCA training data). That's structurally the worst regime for LCA: SVD is the closed-form optimal fit for exactly the data it's being scored against, while Hebbian dictionary learning has no such closed-form advantage on the same limited data — it's more data-hungry, not less.
+
+Two independent reasons to bring in more snapshots:
+
+- **Generalization for the dictionary.** Training patches from only one timestep risk the LCA atoms overfitting to that instant's specific vortex arrangement rather than the turbulence class's general local statistics. Pooling patches across timesteps (and ideally across simulation runs) should let the same rel_err be hit with lower `avg_active`, since capacity isn't wasted on transient snapshot-specific detail.
+- **Fair comparison requires a train/test split.** Fit both the SVD basis (concat patches from several training snapshots into `X`) and the LCA dictionary on a training pool, then measure rel_err/compression on a *held-out* snapshot. On held-out data SVD loses its "optimal for exactly this data" free lunch, while a convolutional LCA dictionary that learned genuinely repeating local structure should transfer. This is the regime where "beating SVD" is a meaningful claim rather than an artifact of SVD being handicapped by only seeing one snapshot's ~hundreds of patches to fit against.
+
+Next step if pursued: extend `_HDF5PatchDataset` to sample across a list of timesteps, and add a held-out-timestep eval path to `svd_lca_hybrid.py` so the comparison is apples-to-apples.
+
 ### WARP-LCA: Warm-started LCA with CNN Predictor
 #### scripts used
 - lca_sim_mldc_warp.py
