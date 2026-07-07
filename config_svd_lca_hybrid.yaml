@@ -1,0 +1,45 @@
+svd:
+  backend: "sklearn"    # default: randomized_svd — fast when k_max << P³. If k_max is close to
+                        # P³ (small patch_size, e.g. P=9 → P³=729) randomized SVD's power-iteration
+                        # passes lose their advantage and can be several times slower than exact SVD
+                        # — switch to "numpy" in that case, or override per-run: --svd-backend numpy
+
+data:
+  h5_path:   "/data/mldc/pde_bench/Turb_M1.hdf5"
+  field_key: "pressure"
+  timestep:  15          # index into the nt dimension (0-based → physical t=16); used as fallback
+                          # when train_timesteps is absent (single-snapshot fit==eval mode)
+  # --- multi-snapshot training + held-out eval (optional) ---
+  #train_timesteps: [5, 10, 15, 20, 25, 30]  # pool of snapshots to fit SVD basis + LCA dict (nt=41, 0-40)
+  #eval_timestep:   35                        # held-out snapshot for generalization eval, never fit on
+  patch_size: 9           # 3D patch side length for the SVD tiling
+
+lca:
+  # Hybrid architecture: SVD absorbs the smooth global modes cheaply at a small k, then this
+  # overcomplete conv LCA dictionary mops up only the (sparser, more non-Gaussian) residual —
+  # attacking bytes_svd(small k) + bytes_lca(very sparse) vs. a much larger standalone SVD k
+  # needed for the same rel_err.
+  svd_k: 70             # SVD rank for the residual; null → use best k from sweep
+  features: 128          # overcomplete relative to the residual's reduced complexity
+  kernel_size: 3        # must be odd
+  stride: 3             # non-overlapping. svd_lca_hybrid.py runs LCA on the FULL tiled residual
+                         # volume (D_out=252=28x9 for patch_size=9), so stride must divide D_out
+                         # under pad='same' — stride=8 breaks with a shape-mismatch crash; 9 is
+                         # both a valid divisor of 252 and matches kernel_size (non-overlapping).
+  lambda_: 2.0
+  tau: 100
+  lca_iters: 500        # 5τ — well converged without excess compute
+  learning_rate: 0.002  # low lr avoids epoch-to-epoch oscillation
+  max_epochs: 200
+  n_passes_per_epoch: 30
+  dtype: "float32"
+  lambda_anneal_stop:  100
+  lambda_anneal_every: 1
+  lambda_anneal_step:  0.5
+  rel_err_target:  0.07   # Hybrid_err threshold (SVD+LCA vs full input, NOT LCA_res_err vs
+                           # residual — see svd_lca_hybrid.py's state machine). Set from the
+                           # observed Hybrid_err trend (~0.065 after 44 epochs in
+                           # svd_lca_2026-07-06_16-25-51) — the old 0.01 (1%) was unreachable,
+                           # so λ was frozen in [pre-anneal] the entire run and comp_ratio never grew.
+  rel_err_ceiling: 0.10   # gate λ increment above this error (Hybrid_err)
+  stabilize_epochs: 10

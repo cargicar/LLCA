@@ -32,15 +32,36 @@ of SVD being optimal for the exact data it was fit on. Both keys are
 optional; omitting them reproduces the original single-snapshot fit==eval
 behaviour exactly.
 
+Config
+------
+Dedicated config: config_svd_lca_hybrid.yaml, containing the `data:` and
+`lca:` sections this script reads, plus an optional `svd:` section:
+
+    svd:
+      backend: "sklearn"   # default. "sklearn" (randomized_svd) or "numpy" (exact, full SVD)
+
+`sklearn`'s randomized_svd is the default and is fast when sweeping k_max far
+below the full patch rank P³. But when k_max is close to P³ (typical for
+small patch_size, e.g. P=9 → P³=729), randomized SVD loses its advantage —
+its power-iteration passes over the full patch matrix end up several times
+*slower* than numpy's exact SVD for the same near-full-rank request. Override
+per-run with `--svd-backend numpy` without editing the config.
+
 Usage
 -----
-    python svd_lca_hybrid.py config_simmldc.yaml            # single GPU / SVD only
-    python svd_lca_hybrid.py config_simmldc.yaml            # SVD + LCA (lca: in config)
-    torchrun --nproc_per_node=4 svd_lca_hybrid.py config_simmldc.yaml
+    python svd_lca_hybrid.py config_svd_lca_hybrid.yaml      # single GPU / SVD only
+    python svd_lca_hybrid.py config_svd_lca_hybrid.yaml      # SVD + LCA (lca: in config)
+    torchrun --nproc_per_node=4 svd_lca_hybrid.py config_svd_lca_hybrid.yaml
 
     # multi-snapshot training + held-out eval, overriding the config
-    python svd_lca_hybrid.py config_simmldc.yaml \
+    python svd_lca_hybrid.py config_svd_lca_hybrid.yaml \
         --train-timesteps 5 10 15 20 25 30 --eval-timestep 35
+
+    # Inference 
+    python svd_lca_hybrid.py config_svd_lca_hybrid.yaml --infer \
+    --load-model experiments/svd_lca_.../models/lca_hybrid_best_compression.pth \
+    --infer-timestep 35
+
 """
 
 import argparse
@@ -224,6 +245,170 @@ def compute_metrics_from_patches(
     )
 
 
+def _volume_metrics(input_vol: np.ndarray, recon_vol: np.ndarray):
+    """rel_err, rmse, psnr for one reconstructed volume vs. its input."""
+    err       = input_vol - recon_vol
+    mse       = float((err ** 2).mean())
+    rmse      = float(np.sqrt(mse))
+    rel_err   = rmse / (float(np.sqrt((input_vol ** 2).mean())) + 1e-8)
+    sig_range = float(input_vol.max() - input_vol.min())
+    psnr      = float(20 * np.log10(sig_range / (rmse + 1e-12)))
+    return rel_err, rmse, psnr
+
+
+def _run_inference(args, cfg, device):
+    """
+    Inference-only mode: no SVD re-fitting, no LCA training. Loads the SVD
+    basis saved alongside --load-model (svd_basis.npz) and the frozen LCA
+    checkpoint, then reconstructs one target snapshot two ways:
+      - SVD-only : project onto the saved Vt basis
+      - Hybrid   : SVD-only + frozen LCA encoding of the residual
+    Saves both reconstructions (.npy), a side-by-side metrics CSV, run.log,
+    and a comparison plot.
+    """
+    dcfg    = cfg['data']
+    lca_cfg = cfg['lca']
+    P       = dcfg['patch_size']
+
+    models_dir = os.path.dirname(os.path.abspath(args.load_model))
+    basis_path = os.path.join(models_dir, 'svd_basis.npz')
+    basis  = np.load(basis_path)
+    Vt     = basis['Vt']            # (k_lca, P³) — the basis fit at training time
+    k_lca  = int(basis['k'])
+
+    infer_timestep = (args.infer_timestep if args.infer_timestep is not None
+                       else dcfg.get('eval_timestep', dcfg['timestep']))
+
+    src_exp_dir = os.path.dirname(models_dir)   # .../experiments/svd_lca_<ts>
+    out_dir = args.output_dir or os.path.join(
+        src_exp_dir, 'inference_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    )
+    plots_dir = os.path.join(out_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    _log = open(os.path.join(out_dir, 'run.log'), 'w')
+
+    def log(msg=''):
+        line = msg + '\n'
+        sys.__stdout__.write(line)
+        _log.write(line); _log.flush()
+
+    log("Inference — SVD-only + Hybrid (no re-fitting, frozen checkpoint)")
+    log(f"  Source model   : {args.load_model}")
+    log(f"  SVD basis      : {basis_path}  (k={k_lca})")
+    log(f"  Infer timestep : {infer_timestep}")
+    log(f"  Output dir     : {out_dir}\n")
+
+    vol, _, _ = load_normalized_volume(dcfg['h5_path'], dcfg['field_key'], infer_timestep)
+    X, means, stds, positions, (nD, nH, nW) = extract_tiled_patches(vol, P)
+    shape = (nD * P, nH * P, nW * P)
+    D_out, H_out, W_out = shape
+    input_vol = vol[:D_out, :H_out, :W_out].copy()
+    n_patches = len(positions)
+    bytes_in  = D_out * H_out * W_out * 4
+
+    # --- SVD-only reconstruction — project onto the saved basis, no re-fitting ---
+    coeffs_svd = X @ Vt.T
+    svd_recon  = reconstruct_volume(coeffs_svd, Vt, means, stds, positions, shape, P)
+    svd_rel_err, svd_rmse, svd_psnr = _volume_metrics(input_vol, svd_recon)
+    bytes_svd       = n_patches * k_lca * 4
+    svd_comp_ratio  = bytes_in / bytes_svd
+    svd_bpv         = bytes_svd * 8 / (D_out * H_out * W_out)
+
+    # --- Hybrid reconstruction — frozen LCA on the SVD residual ---
+    stride_lca = lca_cfg['stride']
+    if D_out % stride_lca != 0:
+        divisors = [d for d in range(1, D_out + 1) if D_out % d == 0]
+        raise ValueError(
+            f"lca.stride={stride_lca} does not evenly divide D_out={D_out} "
+            f"(patch_size={P} × {D_out // P} tiles). Valid strides: {divisors}"
+        )
+
+    dtype_str = lca_cfg.get('dtype', 'float32')
+    dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype_str]
+
+    lca = LCAConv3D(
+        out_neurons   = lca_cfg['features'],
+        in_neurons    = 1,
+        kernel_size   = lca_cfg['kernel_size'],
+        stride        = stride_lca,
+        lambda_       = lca_cfg['lambda_'],
+        tau           = lca_cfg['tau'],
+        lca_iters     = lca_cfg['lca_iters'],
+        eta           = lca_cfg['learning_rate'],
+        track_metrics = False,
+        return_vars   = ['inputs', 'acts', 'recons', 'recon_errors'],
+    ).to(dtype=dtype, device=device)
+    lca.load_state_dict(torch.load(args.load_model, map_location=device))
+
+    residual = (input_vol - svd_recon).astype(np.float32)
+    res_mean = float(residual.mean())
+    res_std  = float(residual.std()) + 1e-8
+    residual_tensor = torch.tensor(
+        (residual - res_mean) / res_std, dtype=dtype, device=device
+    ).unsqueeze(0).unsqueeze(0)
+
+    with torch.no_grad():
+        _, code, recon_norm, _ = lca(residual_tensor)
+
+    cd, ch, cw   = ceil(D_out / stride_lca), ceil(H_out / stride_lca), ceil(W_out / stride_lca)
+    n_code_total = lca_cfg['features'] * cd * ch * cw
+    active_nz    = float((code != 0).float().sum().item())
+    sparsity     = 1.0 - active_nz / n_code_total
+    index_bits   = int(np.ceil(np.log2(n_code_total + 1)))
+    bytes_per_nz = 4 + (index_bits + 7) // 8
+
+    lca_recon    = recon_norm[0, 0].float().cpu().numpy() * res_std + res_mean
+    hybrid_recon = svd_recon + lca_recon
+    hybrid_rel_err, hybrid_rmse, hybrid_psnr = _volume_metrics(input_vol, hybrid_recon)
+
+    bytes_lca         = active_nz * bytes_per_nz
+    bytes_total       = bytes_svd + bytes_lca
+    hybrid_comp_ratio = bytes_in / bytes_total
+    hybrid_bpv        = bytes_total * 8 / (D_out * H_out * W_out)
+
+    log(f"{'Metric':<20}  {'SVD-only':>14}  {'Hybrid':>14}")
+    log('-' * 52)
+    log(f"{'rel_err':<20}  {svd_rel_err:>14.6f}  {hybrid_rel_err:>14.6f}")
+    log(f"{'RMSE':<20}  {svd_rmse:>14.6f}  {hybrid_rmse:>14.6f}")
+    log(f"{'PSNR (dB)':<20}  {svd_psnr:>14.2f}  {hybrid_psnr:>14.2f}")
+    log(f"{'sparsity':<20}  {'—':>14}  {sparsity:>14.3f}")
+    log(f"{'comp_ratio':<20}  {svd_comp_ratio:>13.2f}x  {hybrid_comp_ratio:>13.2f}x")
+    log(f"{'BPV':<20}  {svd_bpv:>14.3f}  {hybrid_bpv:>14.3f}")
+    log()
+
+    np.save(os.path.join(out_dir, 'svd_recon.npy'), svd_recon)
+    np.save(os.path.join(out_dir, 'hybrid_recon.npy'), hybrid_recon)
+    log(f"Saved {os.path.join(out_dir, 'svd_recon.npy')}")
+    log(f"Saved {os.path.join(out_dir, 'hybrid_recon.npy')}")
+
+    csv_path = os.path.join(out_dir, 'inference_results.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'method', 'timestep', 'k', 'rel_err', 'rmse', 'psnr',
+            'sparsity', 'comp_ratio', 'bpv',
+        ])
+        writer.writeheader()
+        writer.writerow(dict(method='svd_only', timestep=infer_timestep, k=k_lca,
+                              rel_err=svd_rel_err, rmse=svd_rmse, psnr=svd_psnr,
+                              sparsity='', comp_ratio=svd_comp_ratio, bpv=svd_bpv))
+        writer.writerow(dict(method='hybrid', timestep=infer_timestep, k=k_lca,
+                              rel_err=hybrid_rel_err, rmse=hybrid_rmse, psnr=hybrid_psnr,
+                              sparsity=sparsity, comp_ratio=hybrid_comp_ratio, bpv=hybrid_bpv))
+    log(f"Saved {csv_path}")
+
+    _plot_reconstruction_grid(
+        plots_dir, 'inference_reconstruction.png',
+        input_vol=input_vol, svd_recon=svd_recon, hybrid_recon=hybrid_recon,
+        title=(f'Inference — t={infer_timestep}  SVD k={k_lca}  '
+               f'SVD rel_err={svd_rel_err:.4f} ({svd_comp_ratio:.1f}x)  |  '
+               f'Hybrid rel_err={hybrid_rel_err:.4f} ({hybrid_comp_ratio:.1f}x)'),
+    )
+
+    log("\nDone.")
+    _log.close()
+
+
 def _plot_reconstruction_grid(plots_dir, filename, input_vol, svd_recon, hybrid_recon, title):
     """Input / SVD recon / Hybrid recon / Error, three orthogonal mid-planes."""
     D, H, W = input_vol.shape
@@ -284,11 +469,41 @@ def main():
     parser.add_argument('--eval-timestep', type=int, default=None,
                         help='override data.eval_timestep — held-out timestep for '
                              'generalization evaluation (never used in fitting)')
+    parser.add_argument('--infer', action='store_true',
+                        help='skip fitting entirely; load a trained checkpoint (--load-model) '
+                             'and the svd_basis.npz saved alongside it, then reconstruct one '
+                             'target snapshot both as SVD-only and as the SVD+LCA hybrid')
+    parser.add_argument('--load-model', default=None, metavar='PATH',
+                        help='path to a trained LCA checkpoint (.pth), e.g. '
+                             'experiments/svd_lca_.../models/lca_hybrid_best_compression.pth '
+                             '— svd_basis.npz must be in the same directory')
+    parser.add_argument('--infer-timestep', type=int, default=None, metavar='T',
+                        help='HDF5 timestep to run inference on '
+                             '(default: data.eval_timestep, else data.timestep)')
+    parser.add_argument('--svd-backend', choices=['sklearn', 'numpy'], default=None,
+                        help='override svd.backend from the config. sklearn (default) uses '
+                             'randomized_svd — fast when sweeping k_max << full patch rank P³. '
+                             'numpy uses exact np.linalg.svd — faster when k_max is close to '
+                             'P³ (e.g. small patch_size), where randomized_svd loses its '
+                             'advantage and can be several times slower.')
     parser.add_argument('--output-dir', default=None)
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    # ------------------------------------------------------------------ #
+    # Inference-only mode — no SVD fit, no LCA training, single process
+    # ------------------------------------------------------------------ #
+    if args.infer:
+        if args.load_model is None:
+            raise ValueError("--infer requires --load-model")
+        if cfg.get('lca') is None:
+            raise ValueError("--infer requires an `lca:` section in the config "
+                              "(needed for LCAConv3D architecture parameters)")
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        _run_inference(args, cfg, device)
+        return
 
     # ------------------------------------------------------------------ #
     # DDP setup
@@ -306,6 +521,13 @@ def main():
     dcfg = cfg['data']
     P    = dcfg['patch_size']
     lca_cfg = cfg.get('lca')  # None → SVD-only run
+
+    svd_backend = args.svd_backend or cfg.get('svd', {}).get('backend', 'sklearn')
+    if svd_backend == 'sklearn' and not _HAVE_SKLEARN:
+        if is_main:
+            print("Warning: sklearn not installed — falling back to numpy SVD")
+        svd_backend = 'numpy'
+    use_sklearn_svd = (svd_backend == 'sklearn')
 
     train_timesteps = args.train_timesteps or dcfg.get('train_timesteps') or [dcfg['timestep']]
     eval_timestep = (args.eval_timestep if args.eval_timestep is not None
@@ -344,7 +566,7 @@ def main():
         print(f"Output dir : {out_dir}")
         print(f"Config     : {args.config}")
         print(f"Patch size : {P}³ = {P**3:,} voxels")
-        print(f"SVD backend: {'sklearn randomized_svd' if _HAVE_SKLEARN else 'numpy linalg.svd'}")
+        print(f"SVD backend: {'sklearn randomized_svd' if use_sklearn_svd else 'numpy linalg.svd (exact)'}")
         print(f"Train timesteps : {train_timesteps}")
         print(f"Eval timestep   : "
               f"{eval_timestep if eval_timestep is not None else '(none — no held-out generalization test)'}\n")
@@ -395,7 +617,7 @@ def main():
     if is_main:
         print(f"Computing truncated SVD (k_max={k_max}) ...")
 
-    if _HAVE_SKLEARN:
+    if use_sklearn_svd:
         U, s, Vt = randomized_svd(X_train, n_components=k_max, random_state=42)
     else:
         U_full, s_full, Vt_full = np.linalg.svd(X_train, full_matrices=False)
@@ -773,7 +995,7 @@ def main():
         order = list(range(len(residual_tensors)))
 
         for pass_idx in range(n_passes_per_epoch):
-            random.Random((epoch, pass_idx)).shuffle(order)
+            random.Random(epoch * 1_000_000 + pass_idx).shuffle(order)
             for vi in order:
                 residual_tensor = residual_tensors[vi]
                 inputs_norm, code, recon_norm, recon_error_norm = lca(residual_tensor)
@@ -888,6 +1110,16 @@ def main():
         if using_ddp:
             cleanup_ddp()
         return
+
+    svd_only_comp_ratio = bytes_in / bytes_svd if bytes_svd > 0 else float('inf')
+    print(f"\n{'='*60}")
+    print(f"TRAINING COMPLETE — SVD-only vs. Hybrid compression ratio")
+    print(f"{'='*60}")
+    print(f"SVD-only  comp_ratio={svd_only_comp_ratio:.2f}x  "
+          f"(k={k_lca}, mean train rel_err={svd_rel_err:.4f})")
+    print(f"Hybrid    comp_ratio={comp_ratio:.2f}x  "
+          f"(k={k_lca} + LCA, mean train rel_err={hybrid_rel_err:.4f})")
+    print(f"  (both exclude dictionary/basis overhead — same byte formula, directly comparable)\n")
 
     np.savez_compressed(
         os.path.join(models_dir, 'svd_basis.npz'),
@@ -1008,15 +1240,16 @@ def main():
             (np.linalg.norm(input_vol_eval) + 1e-8)
         )
 
-        n_patches_eval   = len(positions_eval)
-        bytes_in_eval    = eDe * eHe * eWe * 4
-        bytes_svd_eval   = n_patches_eval * k_lca * 4
-        bytes_lca_eval   = active_nz_eval * _bytes_per_nz
-        bytes_total_eval = bytes_svd_eval + bytes_lca_eval
-        comp_ratio_eval  = bytes_in_eval / bytes_total_eval if bytes_total_eval > 0 else float('inf')
-        bpv_eval         = bytes_total_eval * 8 / (eDe * eHe * eWe)
+        n_patches_eval       = len(positions_eval)
+        bytes_in_eval        = eDe * eHe * eWe * 4
+        bytes_svd_eval       = n_patches_eval * k_lca * 4
+        bytes_lca_eval       = active_nz_eval * _bytes_per_nz
+        bytes_total_eval     = bytes_svd_eval + bytes_lca_eval
+        svd_only_comp_eval   = bytes_in_eval / bytes_svd_eval if bytes_svd_eval > 0 else float('inf')
+        comp_ratio_eval      = bytes_in_eval / bytes_total_eval if bytes_total_eval > 0 else float('inf')
+        bpv_eval             = bytes_total_eval * 8 / (eDe * eHe * eWe)
 
-        print(f"SVD-only  rel_err={svd_rel_err_eval:.6f}")
+        print(f"SVD-only  rel_err={svd_rel_err_eval:.6f}  comp_ratio={svd_only_comp_eval:.2f}x")
         print(f"Hybrid    rel_err={hybrid_rel_err_eval:.6f}  sparsity={sparsity_eval:.3f}  "
               f"active={active_nz_eval:.0f}/{n_code_eval}  "
               f"comp_ratio={comp_ratio_eval:.2f}x  BPV={bpv_eval:.2f}")
@@ -1027,13 +1260,14 @@ def main():
         with open(eval_csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
                 'eval_timestep', 'train_timesteps', 'svd_k',
-                'svd_rel_err', 'hybrid_rel_err', 'active_nz', 'sparsity',
+                'svd_rel_err', 'svd_comp_ratio', 'hybrid_rel_err', 'active_nz', 'sparsity',
                 'comp_ratio', 'bpv', 'train_hybrid_rel_err',
             ])
             writer.writeheader()
             writer.writerow(dict(
                 eval_timestep=eval_timestep, train_timesteps=str(train_timesteps), svd_k=k_lca,
-                svd_rel_err=svd_rel_err_eval, hybrid_rel_err=hybrid_rel_err_eval,
+                svd_rel_err=svd_rel_err_eval, svd_comp_ratio=svd_only_comp_eval,
+                hybrid_rel_err=hybrid_rel_err_eval,
                 active_nz=active_nz_eval, sparsity=sparsity_eval,
                 comp_ratio=comp_ratio_eval, bpv=bpv_eval,
                 train_hybrid_rel_err=hybrid_rel_err,
